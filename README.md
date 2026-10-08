@@ -181,7 +181,7 @@ Without a command after `--` it prints one line, for example `personal 5h 38% ·
 
 ## Resets column
 
-Anthropic gives accounts usage-limit reset grants (for example "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max"), claimed in Claude Code with `/rate-limit-options`. The Resets column shows the resets left out of the total of the grants that have not expired, for example `0/1` (used) or `1/1` (still there); `--json list` lists each grant with its label and end date under `usage.reset_grants`. When a reply carries no grant data, the column falls back to the weekly session-reset offer.
+Anthropic gives accounts usage-limit reset grants (for example "Claude Opus 5.5 launch: one usage-limit reset for Pro and Max"), claimed in Claude Code with `/rate-limit-options`. The Resets column shows how many resets are left in the grants that have not expired, with the date the first of them expires, for example `0` (used) or `1 (10-22)` (one left, expires October 22); `--json list` lists each grant with its label and end date under `usage.reset_grants`. When a reply carries no grant data, the column falls back to the weekly session-reset offer.
 
 Anthropic only reveals this to Claude Code itself, so the usage request identifies as Claude Code (`User-Agent: claude-cli/<version>`, `x-app: cli`). If Anthropic starts expecting a newer Claude Code version, set `CS_CLAUDE_CODE_VERSION` (for example to the output of `claude --version`) until paper-claude-switch is updated.
 

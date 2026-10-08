@@ -52,17 +52,29 @@ fn no_cedar_ember_block_means_no_grant_data() {
 }
 
 #[test]
-fn the_column_shows_resets_left_out_of_the_total() {
-    let used = [grant(0, 1, Some("2099-10-22T16:00:00Z"))];
-    assert_eq!(resets_label(Some(&used), None), ("0/1".to_string(), false));
-    let some = [grant(1, 1, Some("2099-10-22T16:00:00Z")), grant(2, 2, None)];
-    assert_eq!(resets_label(Some(&some), None), ("3/3".to_string(), true));
+fn the_column_shows_how_many_resets_are_left() {
+    let used = [grant(0, 1, Some("2099-10-22T12:00:00Z"))];
+    assert_eq!(resets_label(Some(&used), None), ("0".to_string(), false));
+    let no_end = [grant(2, 2, None)];
+    assert_eq!(resets_label(Some(&no_end), None), ("2".to_string(), true));
+}
+
+/// Resets still left show when the first of them expires (local date).
+#[test]
+fn resets_left_show_their_earliest_expiry() {
+    let some = [
+        grant(1, 1, Some("2099-11-05T12:00:00Z")),
+        grant(1, 1, Some("2099-10-22T12:00:00Z")),
+        grant(0, 1, Some("2099-10-01T12:00:00Z")),
+        grant(2, 2, None),
+    ];
+    assert_eq!(resets_label(Some(&some), None), ("4 (10-22)".to_string(), true));
 }
 
 #[test]
 fn expired_grants_do_not_count() {
-    let grants = [grant(1, 1, Some("2000-01-01T00:00:00Z")), grant(0, 1, Some("2099-01-01T00:00:00Z"))];
-    assert_eq!(resets_label(Some(&grants), None), ("0/1".to_string(), false));
+    let grants = [grant(1, 1, Some("2000-01-01T00:00:00Z")), grant(0, 1, Some("2099-01-01T12:00:00Z"))];
+    assert_eq!(resets_label(Some(&grants), None), ("0".to_string(), false));
     let all_expired = [grant(1, 1, Some("2000-01-01T00:00:00Z"))];
     assert_eq!(resets_label(Some(&all_expired), None).0, "0");
 }

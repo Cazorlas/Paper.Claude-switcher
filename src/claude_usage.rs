@@ -56,7 +56,7 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
 
 /// Resets-column cell and whether a reset is left. Usage-limit reset grants
 /// (Codex-like reset cards) decide it when the reply carried them: resets left
-/// out of the total of the grants that have not expired, e.g. `0/1`. Without
+/// of the grants that have not expired, with the first expiry of those left, e.g. `0` or `1 (10-22)`. Without
 /// grant data the weekly session-reset offer is shown instead.
 pub fn resets_label(
     grants: Option<&[crate::claude_api::ResetGrant]>,
@@ -83,8 +83,18 @@ pub fn resets_label(
         return ("0".into(), false);
     }
     let left: u32 = live.iter().map(|grant| grant.resets_left).sum();
-    let total: u32 = live.iter().map(|grant| grant.resets_total.max(grant.resets_left)).sum();
-    (format!("{left}/{total}"), left > 0)
+    // The first of the remaining resets to expire, in local time.
+    let expires = live
+        .iter()
+        .filter(|grant| grant.resets_left > 0)
+        .filter_map(|grant| grant.ends_at.as_deref())
+        .filter_map(|at| DateTime::parse_from_rfc3339(at).ok())
+        .min()
+        .map(|at| at.with_timezone(&chrono::Local).format("%m-%d").to_string());
+    match expires {
+        Some(date) => (format!("{left} ({date})"), left > 0),
+        None => (left.to_string(), left > 0),
+    }
 }
 
 /// Resets-column cell (how many session-limit resets are left) and whether one
