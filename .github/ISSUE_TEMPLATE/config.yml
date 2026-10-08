@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Windows Defender / SmartScreen blocks the program
-    url: https://github.com/Cazorlas/Paper.Codex-switcher#windows-defender--smartscreen
+    url: https://github.com/Cazorlas/Paper.Claude-switcher#windows-security-says-trojanwin32ml
     about: The Windows binary is not code-signed yet; see the README for how to verify and allow it.
