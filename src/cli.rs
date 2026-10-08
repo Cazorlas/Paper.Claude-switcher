@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -124,9 +126,21 @@ Examples:
         /// Profile alias (default: derived from the account email; a saved account keeps its alias)
         alias: Option<String>,
     },
-    /// Manually check GitHub Releases (`--check`) or update this binary
+    /// Import the Claude accounts the Orca app manages as profiles
     #[command(
-        after_help = "Examples:\n  paper-claude-switch self-update --check\n  paper-claude-switch self-update\n  paper-claude-switch self-update --dev\n  paper-claude-switch self-update --stable\n\nOnly the TUI checks automatically at startup. Other commands never check automatically.\nWithout flags, updates within the current channel (stable or dev).\n`--dev` switches to the dev channel. `--stable` switches back to stable."
+        after_help = "Reads <orca>/<id>/auth/{.credentials.json,oauth-account.json} for each Orca account. A new account becomes a profile; a saved account is updated only when Orca holds the fresher login; anything else is kept as is. Orca's files are never changed.\n\nExamples:\n  paper-claude-switch import-orca --dry-run\n  paper-claude-switch import-orca\n  paper-claude-switch --json import-orca --from /path/to/claude-accounts"
+    )]
+    ImportOrca {
+        /// Orca accounts folder (default: <config dir>/orca/claude-accounts)
+        #[arg(long, value_name = "DIR")]
+        from: Option<PathBuf>,
+        /// Report what would be imported without writing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check for a newer version (`--check`) or update this binary
+    #[command(
+        after_help = "Examples:\n  paper-claude-switch self-update --check\n  paper-claude-switch self-update\n\nOnly the TUI checks automatically at startup. Other commands never check automatically."
     )]
     SelfUpdate {
         /// Check whether a newer version is available without installing it

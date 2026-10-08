@@ -80,6 +80,7 @@ No restart needed: Claude Code re-reads its credential file when it changes, so 
 | Rename | `paper-claude-switch rename <old> <new>` |
 | Delete (archived, recoverable; the active account can't be deleted) | `paper-claude-switch delete <alias> [--yes]` |
 | List deleted accounts / bring one back | `paper-claude-switch restore` / `paper-claude-switch restore <alias> [--as <new>]` |
+| Import the accounts Orca manages | `paper-claude-switch import-orca [--dry-run]` |
 | Refresh usage now, ignoring the cache | `paper-claude-switch list --force` |
 | Open the data folder | `paper-claude-switch open` |
 | Check Claude Code version and setup | `paper-claude-switch doctor` |
@@ -87,6 +88,12 @@ No restart needed: Claude Code re-reads its credential file when it changes, so 
 Global flags: `--json` / `--json-pretty` (machine-readable output), `--proxy <url>`, `--color always|never`, `--debug`. Settings live in `~/.paper-claude-switch/config.toml` (also editable in the `tui` Settings tab).
 
 To remove accounts you no longer use: `list`, then `delete <alias>`. Deleting is not final: `restore` lists what was deleted and `restore <alias>` brings the newest archive back (use `--as` if the name is taken). Archives live in `~/.paper-claude-switch/deleted-profiles`. `auto` only switches between saved accounts, so deleting an account also takes it out of rotation.
+
+### Using with Orca
+
+1. In Orca, set the Claude account to **System default**, so Orca runs Claude Code on `~/.claude`, the login paper-claude-switch switches.
+2. Run `paper-claude-switch import-orca` once (add `--dry-run` to preview). It copies each Orca account into a profile: new accounts are created, a saved account is updated only when Orca holds the fresher login, and the rest are left as they are. Orca's own files are never changed. Use `--from <dir>` if Orca keeps its accounts somewhere else (default: `orca/claude-accounts` in your config folder).
+3. Remove those accounts in Orca (Settings > Accounts), so only one app refreshes each login.
 
 ### Update / uninstall
 

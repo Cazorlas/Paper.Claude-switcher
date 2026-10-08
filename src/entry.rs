@@ -152,6 +152,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Delete { .. } => "delete",
         Commands::Restore { .. } => "restore",
         Commands::Login { .. } => "login",
+        Commands::ImportOrca { .. } => "import-orca",
         Commands::SelfUpdate { .. } => "self-update",
         Commands::Launch { .. } => "launch",
         Commands::Tui => "tui",
@@ -182,6 +183,7 @@ async fn dispatch(
         && !matches!(
             &cmd,
             Commands::Login { .. }
+                | Commands::ImportOrca { .. }
                 | Commands::SelfUpdate { .. }
                 | Commands::Open
                 | Commands::Launch { .. }
@@ -221,6 +223,9 @@ async fn dispatch(
         }
         Commands::Delete { alias, yes } => commands::delete_cmd(&alias, yes, json)?,
         Commands::Login { alias } => commands::login_cmd(alias.as_deref(), json)?,
+        Commands::ImportOrca { from, dry_run } => {
+            commands::import_orca_cmd(from.as_deref(), dry_run, json)?
+        }
         Commands::SelfUpdate { check } => commands::self_update_cmd(check, json)?,
         Commands::Launch { alias, args, .. } => {
             let args = merge_launch_args(args, launch_passthrough);

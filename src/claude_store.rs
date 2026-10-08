@@ -115,6 +115,75 @@ pub fn save_current(
     Ok(action)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportKind {
+    Created,
+    Updated,
+    Kept,
+}
+
+pub struct ImportOutcome {
+    pub alias: String,
+    pub kind: ImportKind,
+}
+
+/// Build an account from a credentials object and an `oauthAccount` object
+/// read from another app's files; rejects what a profile could not hold.
+pub fn account_from_parts(credentials: &Value, account: &Value) -> Result<LiveAccount> {
+    let oauth = credentials.get("claudeAiOauth").context("credentials hold no claudeAiOauth")?;
+    validate_account(oauth, account)?;
+    live_account(credentials, &json!({"oauthAccount": account}))?
+        .context("account holds no accountUuid")
+}
+
+/// Saves accounts found elsewhere into the profiles dir. Never reads or writes
+/// the live Claude files or the `current` marker. In dry-run it only plans.
+pub struct ProfileImporter {
+    app_home: PathBuf,
+    dry_run: bool,
+    profiles: Vec<SavedProfile>,
+}
+
+impl ProfileImporter {
+    pub fn new(app_home: &Path, dry_run: bool) -> Result<Self> {
+        Ok(Self { app_home: app_home.to_path_buf(), dry_run, profiles: load_profiles(app_home)? })
+    }
+
+    /// New account: create. Saved account that `incoming` refreshed more
+    /// recently (greater `expiresAt`): update. Otherwise leave it alone.
+    pub fn import(&mut self, incoming: LiveAccount) -> Result<ImportOutcome> {
+        let existing = self.profiles.iter().position(|p| p.live.account_uuid == incoming.account_uuid);
+        let (alias, kind) = match existing {
+            Some(index) => {
+                let alias = self.profiles[index].alias.clone();
+                if expires_at(&incoming.oauth) <= expires_at(&self.profiles[index].live.oauth) {
+                    return Ok(ImportOutcome { alias, kind: ImportKind::Kept });
+                }
+                (alias, ImportKind::Updated)
+            }
+            None => {
+                let taken: Vec<&str> = self.profiles.iter().map(|p| p.alias.as_str()).collect();
+                (unique_alias_avoiding(&self.app_home, &inferred_alias(&incoming), &taken)?, ImportKind::Created)
+            }
+        };
+        if !self.dry_run {
+            let mut writes = WriteBatch::default();
+            stage_profile(&mut writes, &self.app_home, &alias, &incoming)?;
+            writes.commit()?;
+        }
+        let saved = SavedProfile { alias: alias.clone(), live: incoming };
+        match existing {
+            Some(index) => self.profiles[index] = saved,
+            None => self.profiles.push(saved),
+        }
+        Ok(ImportOutcome { alias, kind })
+    }
+}
+
+fn expires_at(oauth: &Value) -> f64 {
+    oauth.get("expiresAt").and_then(Value::as_f64).unwrap_or(f64::NEG_INFINITY)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum SwitchOutcome {
     Switched { from: Option<String>, to: String },
@@ -273,6 +342,11 @@ fn inferred_alias(live: &LiveAccount) -> String {
 }
 
 fn unique_alias(app_home: &Path, base: &str) -> Result<String> {
+    unique_alias_avoiding(app_home, base, &[])
+}
+
+/// `taken` holds aliases not yet on disk (a dry run plans without writing).
+fn unique_alias_avoiding(app_home: &Path, base: &str, taken: &[&str]) -> Result<String> {
     crate::profile::validate_alias(base)?;
     let dir = app_home.join("profiles");
     for n in 1..=1000 {
@@ -282,6 +356,9 @@ fn unique_alias(app_home: &Path, base: &str) -> Result<String> {
             let suffix = format!("_{n}");
             format!("{}{}", &base[..base.len().min(64 - suffix.len())], suffix)
         };
+        if taken.contains(&alias.as_str()) {
+            continue;
+        }
         match fs::symlink_metadata(dir.join(&alias)) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(alias),
             Err(error) => return Err(error).context("checking profile alias"),
