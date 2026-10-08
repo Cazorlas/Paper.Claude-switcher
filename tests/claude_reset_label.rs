@@ -25,11 +25,11 @@ fn not_at_the_wall_shows_how_many_resets_are_left() {
     assert_eq!(session_reset_label(Some(&reset(false, Some("not_at_wall"), false, None, 2))).0, "2");
 }
 
-/// Outside Claude Code the server answers "surface": the offer itself is only
-/// claimable in Claude Code, so the column still shows the resets left.
+/// Outside Claude Code the server answers "surface" and says nothing about
+/// whether this week's reset was used, so the count is unknown, not 1.
 #[test]
-fn asked_from_outside_claude_code_shows_how_many_resets_are_left() {
-    assert_eq!(session_reset_label(Some(&reset(false, Some("surface"), false, None, 1))).0, "1");
+fn asked_from_outside_claude_code_the_count_is_unknown() {
+    assert_eq!(session_reset_label(Some(&reset(false, Some("surface"), false, None, 1))).0, "?");
 }
 
 #[test]

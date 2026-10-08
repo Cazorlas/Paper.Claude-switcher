@@ -56,9 +56,9 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
 /// Resets-column cell (how many session-limit resets are left) and whether one
 /// can be claimed right now. A `next_available_at` still ahead means this
 /// week's resets are used: `0 → <when>` in local time. Before the 5-hour wall
-/// Claude reports `not_at_wall`, and asked from outside Claude Code `surface`
-/// (resets are only claimable in Claude Code); both still have their weekly
-/// resets. Any other refusal means this account gets none.
+/// Claude reports `not_at_wall` with the weekly count. Asked from outside
+/// Claude Code it reports `surface` and hides whether the reset was used: `?`.
+/// Any other refusal means this account gets none.
 pub fn session_reset_label(reset: Option<&SessionReset>) -> (String, bool) {
     let Some(reset) = reset else {
         return ("--".into(), false);
@@ -76,7 +76,10 @@ pub fn session_reset_label(reset: Option<&SessionReset>) -> (String, bool) {
         return (format!("{} ready", reset.resets_per_week), true);
     }
     match (reset.eligible, reset.ineligible_reason.as_deref()) {
-        (true, _) | (false, Some("not_at_wall" | "surface")) => (reset.resets_per_week.to_string(), false),
+        (true, _) | (false, Some("not_at_wall")) => (reset.resets_per_week.to_string(), false),
+        // Asked from outside Claude Code the server does not say whether this
+        // week's reset was used, so the count is unknown.
+        (false, Some("surface")) => ("?".into(), false),
         _ => ("n/a".into(), false),
     }
 }
