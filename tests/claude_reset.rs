@@ -265,7 +265,7 @@ async fn json_list_shows_the_session_reset() {
     assert_eq!(rows[1]["usage"]["session_reset"], Value::Null, "an account without an offer");
 }
 
-/// S5: the human `list` has a Reset column saying `ready` and `N/wk`.
+/// S5: the human `list` says how many resets are ready.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn human_list_shows_ready_and_resets_per_week() {
     let f = Fixture::new(usage_body(available_block())).await;
@@ -274,6 +274,5 @@ async fn human_list_shows_ready_and_resets_per_week() {
 
     assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("ready"), "stdout: {text}");
-    assert!(text.contains("2/wk"), "stdout: {text}");
+    assert!(text.contains("2 ready"), "stdout: {text}");
 }

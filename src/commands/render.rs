@@ -182,7 +182,7 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
     if u.session_reset.is_some() {
         let (cell, ready) = crate::claude_usage::session_reset_label(u.session_reset.as_ref());
         let cell = if ready { color::success(&cell) } else { color::dim(&cell) };
-        println!("  {}  {cell}", color::dim("Reset"));
+        println!("  {}  {cell}", color::dim("Resets"));
     }
     if let Some(age) = crate::claude_usage::stale_age_label(u.fetched_at, crate::auth::now_unix_secs()) {
         println!("  {}", color::dim(&format!("\u{b7} {age}")));

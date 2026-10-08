@@ -53,38 +53,32 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
     }
 }
 
-/// Table cell for the session-limit reset offer: `ready` (with `N/wk` when
-/// more than one reset a week), `next MM-DD HH:MM` in local time when it is
-/// used up for now, else `--`. The flag is true when a reset can be used now.
-/// Reset-column cell and whether a reset can be claimed now. Before the
-/// 5-hour wall Claude reports `not_at_wall`, and asked from outside Claude
-/// Code it reports `surface` (the reset is only claimable in Claude Code); both
-/// show the weekly allowance. Any other refusal means this account gets none.
+/// Resets-column cell (how many session-limit resets are left) and whether one
+/// can be claimed right now. A `next_available_at` still ahead means this
+/// week's resets are used: `0 → <when>` in local time. Before the 5-hour wall
+/// Claude reports `not_at_wall`, and asked from outside Claude Code `surface`
+/// (resets are only claimable in Claude Code); both still have their weekly
+/// resets. Any other refusal means this account gets none.
 pub fn session_reset_label(reset: Option<&SessionReset>) -> (String, bool) {
     let Some(reset) = reset else {
         return ("--".into(), false);
     };
-    if !reset.eligible {
-        let text = match reset.ineligible_reason.as_deref() {
-            Some("not_at_wall" | "surface") => format!("{}/wk", reset.resets_per_week),
-            _ => "n/a".into(),
-        };
-        return (text, false);
-    }
-    if reset.available {
-        let text = if reset.resets_per_week > 1 {
-            format!("ready {}/wk", reset.resets_per_week)
-        } else {
-            "ready".into()
-        };
-        return (text, true);
-    }
     let next = reset
         .next_available_at
         .as_deref()
         .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
-        .map(|at| at.with_timezone(&chrono::Local).format("next %m-%d %H:%M").to_string());
-    (next.unwrap_or_else(|| "--".into()), false)
+        .filter(|at| at.timestamp() > crate::auth::now_unix_secs());
+    if let Some(next) = next {
+        let when = next.with_timezone(&chrono::Local).format("%m-%d %H:%M");
+        return (format!("0 \u{2192} {when}"), false);
+    }
+    if reset.eligible && reset.available {
+        return (format!("{} ready", reset.resets_per_week), true);
+    }
+    match (reset.eligible, reset.ineligible_reason.as_deref()) {
+        (true, _) | (false, Some("not_at_wall" | "surface")) => (reset.resets_per_week.to_string(), false),
+        _ => ("n/a".into(), false),
+    }
 }
 
 fn usage_error(error: ApiError) -> UsageError {

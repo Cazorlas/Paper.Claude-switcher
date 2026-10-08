@@ -20,29 +20,36 @@ fn reset(eligible: bool, reason: Option<&str>, available: bool, next: Option<&st
 }
 
 #[test]
-fn not_at_the_wall_shows_the_weekly_allowance() {
-    assert_eq!(session_reset_label(Some(&reset(false, Some("not_at_wall"), false, None, 1))).0, "1/wk");
-    assert_eq!(session_reset_label(Some(&reset(false, Some("not_at_wall"), false, None, 2))).0, "2/wk");
+fn not_at_the_wall_shows_how_many_resets_are_left() {
+    assert_eq!(session_reset_label(Some(&reset(false, Some("not_at_wall"), false, None, 1))).0, "1");
+    assert_eq!(session_reset_label(Some(&reset(false, Some("not_at_wall"), false, None, 2))).0, "2");
 }
 
 /// Outside Claude Code the server answers "surface": the offer itself is only
-/// claimable in Claude Code, so the column still shows the weekly allowance.
+/// claimable in Claude Code, so the column still shows the resets left.
 #[test]
-fn asked_from_outside_claude_code_shows_the_weekly_allowance() {
-    assert_eq!(session_reset_label(Some(&reset(false, Some("surface"), false, None, 1))).0, "1/wk");
+fn asked_from_outside_claude_code_shows_how_many_resets_are_left() {
+    assert_eq!(session_reset_label(Some(&reset(false, Some("surface"), false, None, 1))).0, "1");
 }
 
 #[test]
 fn an_offer_ready_now_says_ready() {
     let (text, ready) = session_reset_label(Some(&reset(true, None, true, None, 1)));
-    assert_eq!(text, "ready");
+    assert_eq!(text, "1 ready");
     assert!(ready);
 }
 
+/// A reset already used this week: none left, and when the next one comes,
+/// whatever the eligibility says. A next time in the past means it is back.
 #[test]
-fn a_used_offer_shows_when_the_next_one_comes() {
-    let text = session_reset_label(Some(&reset(true, None, false, Some("2026-10-12T09:00:00Z"), 1))).0;
-    assert!(text.starts_with("next 10-1"), "{text}");
+fn a_used_reset_shows_zero_and_when_the_next_one_comes() {
+    let used = session_reset_label(Some(&reset(true, None, false, Some("2099-10-12T09:00:00Z"), 1))).0;
+    assert!(used.starts_with("0 \u{2192} 10-1"), "{used}");
+    let before_wall =
+        session_reset_label(Some(&reset(false, Some("not_at_wall"), false, Some("2099-10-12T09:00:00Z"), 1))).0;
+    assert!(before_wall.starts_with("0 \u{2192} 10-1"), "{before_wall}");
+    let back = session_reset_label(Some(&reset(false, Some("not_at_wall"), false, Some("2000-01-01T00:00:00Z"), 1))).0;
+    assert_eq!(back, "1");
 }
 
 #[test]

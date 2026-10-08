@@ -353,7 +353,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
     }
     header_cells.push(Cell::from("7d Reset").style(hdr));
     if show_reset {
-        header_cells.push(Cell::from("Reset").style(hdr));
+        header_cells.push(Cell::from("Resets").style(hdr));
     }
     header_cells.push(Cell::from("Plan until").style(hdr));
 
