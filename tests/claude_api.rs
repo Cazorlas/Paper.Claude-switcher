@@ -39,6 +39,7 @@ fn expected_usage() -> ClaudeUsage {
         }],
         spend: None,
         session_reset: None,
+        reset_grants: None,
     }
 }
 

@@ -332,10 +332,11 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         .accounts
         .iter()
         .any(|entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.primary.is_some()));
-    // The session-limit reset column appears once any account reports its reset state.
-    let show_reset = app.accounts.iter().any(
-        |entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.session_reset.is_some()),
-    );
+    // The Resets column appears once any account reports reset grants or state.
+    let show_reset = app.accounts.iter().any(|entry| {
+        matches!(&entry.usage, UsageStatus::Loaded(usage)
+            if usage.session_reset.is_some() || usage.reset_grants.is_some())
+    });
     let hdr = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
     let mut header_cells = vec![
         Cell::from(" ").style(base().fg(DIM)),
@@ -545,6 +546,11 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                 entry.info.plan_type.as_deref(),
             );
             let (card_until, card_until_level) = (until_text.clone(), until_level);
+            let (card_resets, card_resets_ready) = match &entry.usage {
+                UsageStatus::Loaded(u) => crate::claude_usage::resets_label(u.reset_grants.as_deref(), u.session_reset.as_ref()),
+                _ => ("--".into(), false),
+            };
+            let card_resets_color = if card_resets_ready { C_GREEN } else { DIM };
             let dim = base().fg(DIM);
             cards.push(vec![
                 Line::from(vec![
@@ -574,6 +580,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                             _ => DIM,
                         }),
                     ),
+                    Span::styled(format!("  resets {card_resets}"), base().fg(card_resets_color)),
                 ]),
                 Line::from(""),
             ]);
@@ -602,7 +609,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
             if show_reset {
                 let (text, ready) = match &entry.usage {
                     UsageStatus::Loaded(u) => {
-                        crate::claude_usage::session_reset_label(u.session_reset.as_ref())
+                        crate::claude_usage::resets_label(u.reset_grants.as_deref(), u.session_reset.as_ref())
                     }
                     _ => ("--".into(), false),
                 };
@@ -2040,6 +2047,34 @@ mod tests {
 
         let wide = render(&mut app, 160);
         assert!(wide.contains("Alias") && wide.contains("Email"), "{wide}");
+    }
+
+    #[test]
+    fn narrow_card_shows_the_resets_left() {
+        let mut app = App::new();
+        let usage = UsageInfo {
+            session_reset: Some(crate::claude_api::SessionReset {
+                eligible: false,
+                ineligible_reason: Some("not_at_wall".into()),
+                available: false,
+                next_available_at: None,
+                resets_per_week: 1,
+                billing_period: None,
+            }),
+            ..UsageInfo::default()
+        };
+        app.accounts.push(AccountEntry {
+            alias: "solo".into(),
+            info: AccountInfo { email: Some("solo@x.com".into()), ..AccountInfo::default() },
+            usage: UsageStatus::Loaded(Box::new(usage)),
+            is_current: true,
+        });
+        app.view_indices.push(0);
+        let backend = TestBackend::new(50, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render_account_table(frame, &mut app, frame.area())).unwrap();
+        let text = (0..12).map(|y| row_text(terminal.backend(), y)).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("resets 1"), "{text}");
     }
 
 

@@ -47,6 +47,8 @@ struct CacheEntry {
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
     #[serde(default)]
     session_reset: Option<crate::claude_api::SessionReset>,
+    #[serde(default)]
+    reset_grants: Option<Vec<crate::claude_api::ResetGrant>>,
     /// When the usage endpoint last answered for this alias. The status line
     /// refreshes `ts` without it, so this tells when the rest of the reading
     /// (session reset, per-model windows) needs the endpoint again.
@@ -196,6 +198,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         individual_limit: u.individual_limit.clone(),
         additional_limits: u.additional_limits.clone(),
         session_reset: u.session_reset.clone(),
+        reset_grants: u.reset_grants.clone(),
         api_ts: None,
     }
 }
@@ -236,6 +239,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         additional_limits: e.additional_limits.clone(),
         subscription_status: None,
         session_reset: e.session_reset.clone(),
+        reset_grants: e.reset_grants.clone(),
     }
 }
 

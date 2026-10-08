@@ -42,6 +42,19 @@ pub struct ClaudeUsage {
     pub models: Vec<ModelWindow>,
     pub spend: Option<Spend>,
     pub session_reset: Option<SessionReset>,
+    /// Usage-limit reset grants (`cedar_ember`); `None` when the reply has no
+    /// such block, `Some(vec![])` when the account has no grant.
+    pub reset_grants: Option<Vec<ResetGrant>>,
+}
+
+/// One usage-limit reset grant, like a Codex reset card.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ResetGrant {
+    pub label: String,
+    pub resets_left: u32,
+    pub resets_total: u32,
+    pub ends_at: Option<String>,
+    pub usable_now: bool,
 }
 
 pub fn parse_usage(v: &Value) -> Option<ClaudeUsage> {
@@ -89,7 +102,28 @@ pub fn parse_usage(v: &Value) -> Option<ClaudeUsage> {
         models,
         spend,
         session_reset: v.get("juniper_tide").and_then(parse_session_reset),
+        reset_grants: v.get("cedar_ember").and_then(parse_reset_grants),
     })
+}
+
+/// The grants of a `cedar_ember` block; a malformed grant is skipped.
+fn parse_reset_grants(block: &Value) -> Option<Vec<ResetGrant>> {
+    let grants = block.get("grants")?.as_array()?;
+    Some(
+        grants
+            .iter()
+            .filter_map(|grant| {
+                let count = |key: &str| u32::try_from(grant.get(key)?.as_u64()?).ok();
+                Some(ResetGrant {
+                    label: grant.get("label").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    resets_left: count("resets_left")?,
+                    resets_total: count("resets_total").unwrap_or(0),
+                    ends_at: grant.get("ends_at").and_then(Value::as_str).map(str::to_owned),
+                    usable_now: grant.get("usable_now").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect(),
+    )
 }
 
 /// The `juniper_tide` block; `None` when it is null or malformed.
@@ -190,7 +224,7 @@ pub async fn fetch_usage(
 ) -> Result<ClaudeUsage, UsageError> {
     let response = client
         .get(format!(
-            "{}/api/oauth/usage?at_wall=1",
+            "{}/api/oauth/usage?at_wall=1&cedar_ember=1",
             ep.api_base.trim_end_matches('/')
         ))
         .bearer_auth(access_token)

@@ -81,6 +81,9 @@ pub enum JsonUsage {
         primary: Option<Box<JsonWindow>>,
         secondary: Option<Box<JsonWindow>>,
         session_reset: Option<JsonSessionReset>,
+        /// Usage-limit reset grants; absent when the reply had none.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reset_grants: Option<Vec<crate::claude_api::ResetGrant>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         additional_limits: Vec<JsonAdditionalLimit>,
     },
@@ -203,6 +206,7 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                     next_available_at: reset.next_available_at.clone(),
                     resets_per_week: reset.resets_per_week,
                 }),
+                reset_grants: u.reset_grants.clone(),
                 additional_limits: u
                     .additional_limits
                     .iter()

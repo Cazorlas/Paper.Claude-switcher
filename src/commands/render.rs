@@ -179,8 +179,8 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
         );
     }
     print_additional_pool_lines(&u.additional_limits);
-    if u.session_reset.is_some() {
-        let (cell, ready) = crate::claude_usage::session_reset_label(u.session_reset.as_ref());
+    if u.session_reset.is_some() || u.reset_grants.is_some() {
+        let (cell, ready) = crate::claude_usage::resets_label(u.reset_grants.as_deref(), u.session_reset.as_ref());
         let cell = if ready { color::success(&cell) } else { color::dim(&cell) };
         println!("  {}  {cell}", color::dim("Resets"));
     }

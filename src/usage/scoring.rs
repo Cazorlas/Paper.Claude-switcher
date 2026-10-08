@@ -340,6 +340,7 @@ mod tests {
             additional_limits: vec![],
             subscription_status: None,
             session_reset: None,
+            reset_grants: None,
         }
     }
 

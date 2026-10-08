@@ -69,6 +69,7 @@ pub struct UsageInfo {
     pub subscription_status: Option<String>,
     /// Claude's "reset your session limit" offer, when the account has one.
     pub session_reset: Option<crate::claude_api::SessionReset>,
+    pub reset_grants: Option<Vec<crate::claude_api::ResetGrant>>,
 }
 
 /// One assembled display row for an additional-limit pool. Pure data,
