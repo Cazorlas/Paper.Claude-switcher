@@ -47,12 +47,29 @@ struct CacheEntry {
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
 }
 
+/// Last answer of the profile endpoint for one alias.
+#[derive(Serialize, Deserialize, Clone)]
+struct ProfileEntry {
+    /// When the endpoint was last asked (unix seconds), failures included.
+    checked_at: i64,
+    subscription_status: Option<String>,
+}
+
+/// The profile status is asked for at most this often per alias.
+const PROFILE_STATUS_TTL_SECS: i64 = 6 * 3600;
+
 #[derive(Serialize, Deserialize, Default)]
 struct CacheFile {
     entries: HashMap<String, CacheEntry>,
     /// Tracks the last time each profile was selected by `use` (unix seconds).
     #[serde(default)]
     last_used: HashMap<String, i64>,
+    /// Per alias: the usage endpoint must not be called before this instant
+    /// (unix milliseconds), set from a 429 Retry-After.
+    #[serde(default)]
+    retry_until_ms: HashMap<String, i64>,
+    #[serde(default)]
+    profiles: HashMap<String, ProfileEntry>,
 }
 
 fn cache_path() -> Result<PathBuf> {
@@ -207,7 +224,25 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         rate_limit_reached_type: e.rate_limit_reached_type.clone(),
         individual_limit: e.individual_limit.clone(),
         additional_limits: e.additional_limits.clone(),
+        subscription_status: None,
     }
+}
+
+/// The cached usage of `alias` with its subscription status filled in.
+fn usage_of(cache: &CacheFile, alias: &str) -> Option<UsageInfo> {
+    let mut usage = from_entry(cache.entries.get(alias)?);
+    usage.subscription_status = cache
+        .profiles
+        .get(alias)
+        .and_then(|profile| profile.subscription_status.clone());
+    Some(usage)
+}
+
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Get cached usage for an alias if within TTL.
@@ -220,7 +255,7 @@ pub fn get(alias: &str) -> Option<UsageInfo> {
         if now_secs().saturating_sub(entry.ts) > ttl() {
             return Ok(None);
         }
-        Ok(Some(from_entry(entry)))
+        Ok(usage_of(&cache, alias))
     }) {
         Ok(value) => value,
         Err(err) => {
@@ -230,15 +265,89 @@ pub fn get(alias: &str) -> Option<UsageInfo> {
     }
 }
 
-/// Store usage result in cache.
+/// The last usage stored for an alias, however old.
+pub fn last_good(alias: &str) -> Option<UsageInfo> {
+    match with_cache_lock(|| Ok(usage_of(&load_cache(), alias))) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!("Failed to read cache for {alias}: {err}");
+            None
+        }
+    }
+}
+
+/// Store usage result in cache. A good reading ends any rate-limit pause.
 pub fn put(alias: &str, usage: &UsageInfo) {
     if let Err(err) = with_cache_lock(|| {
         let mut cache = load_cache();
         cache.entries.insert(alias.to_string(), to_entry(usage));
+        cache.retry_until_ms.remove(alias);
         save_cache(&cache)
     }) {
         tracing::warn!("Failed to write cache: {err}");
     }
+}
+
+/// Milliseconds left of the rate-limit pause of `alias`, when one is running.
+pub fn pause_left_ms(alias: &str) -> Option<i64> {
+    match with_cache_lock(|| Ok(load_cache().retry_until_ms.get(alias).copied())) {
+        Ok(until) => until.map(|until| until - now_millis()).filter(|left| *left > 0),
+        Err(err) => {
+            tracing::warn!("Failed to read rate-limit pause for {alias}: {err}");
+            None
+        }
+    }
+}
+
+/// Do not call the usage endpoint for `alias` for the next `wait_ms`.
+pub fn pause_for_ms(alias: &str, wait_ms: i64) {
+    if let Err(err) = with_cache_lock(|| {
+        let mut cache = load_cache();
+        cache.retry_until_ms.insert(alias.to_string(), now_millis().saturating_add(wait_ms));
+        save_cache(&cache)
+    }) {
+        tracing::warn!("Failed to write rate-limit pause: {err}");
+    }
+}
+
+/// True when the profile status of `alias` was never asked for or is older than 6 h.
+pub fn profile_status_due(alias: &str) -> bool {
+    match with_cache_lock(|| Ok(load_cache().profiles.get(alias).map(|p| p.checked_at))) {
+        Ok(Some(checked)) => now_secs() as i64 - checked >= PROFILE_STATUS_TTL_SECS,
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// Record a profile-endpoint attempt. `status` is the new subscription status
+/// on success; `None` (a failure) keeps the previous one.
+pub fn put_profile_status(alias: &str, status: Option<String>) {
+    if let Err(err) = with_cache_lock(|| {
+        let mut cache = load_cache();
+        let previous = cache.profiles.get(alias).and_then(|p| p.subscription_status.clone());
+        cache.profiles.insert(
+            alias.to_string(),
+            ProfileEntry {
+                checked_at: now_secs() as i64,
+                subscription_status: status.or(previous),
+            },
+        );
+        save_cache(&cache)
+    }) {
+        tracing::warn!("Failed to write profile status: {err}");
+    }
+}
+
+/// The cached subscription status of `alias`, however old.
+pub fn profile_status(alias: &str) -> Option<String> {
+    with_cache_lock(|| {
+        Ok(load_cache()
+            .profiles
+            .get(alias)
+            .and_then(|profile| profile.subscription_status.clone()))
+    })
+    .ok()
+    .flatten()
 }
 
 /// Move every record keyed by `old` over to `new`. Returns whether anything moved.
@@ -251,6 +360,14 @@ fn migrate_alias(cache: &mut CacheFile, old: &str, new: &str) -> bool {
     }
     if let Some(ts) = cache.last_used.remove(old) {
         cache.last_used.insert(new.to_string(), ts);
+        changed = true;
+    }
+    if let Some(until) = cache.retry_until_ms.remove(old) {
+        cache.retry_until_ms.insert(new.to_string(), until);
+        changed = true;
+    }
+    if let Some(profile) = cache.profiles.remove(old) {
+        cache.profiles.insert(new.to_string(), profile);
         changed = true;
     }
     changed

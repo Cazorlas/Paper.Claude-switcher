@@ -64,6 +64,9 @@ pub struct UsageInfo {
     pub individual_limit: Option<Box<SpendControlLimit>>,
     /// Per-model rate limits.
     pub additional_limits: Vec<AdditionalRateLimit>,
+    /// Subscription status from the profile endpoint ("active", "canceled",
+    /// "past_due", ...), when known.
+    pub subscription_status: Option<String>,
 }
 
 /// One assembled display row for an additional-limit pool. Pure data,

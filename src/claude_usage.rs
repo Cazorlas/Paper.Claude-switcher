@@ -64,6 +64,51 @@ fn usage_error(error: ApiError) -> UsageError {
     UsageError { summary, detail: format!("Claude usage: {error:?}") }
 }
 
+/// First renewal instant strictly after `now_unix` of a monthly plan created at
+/// `created_rfc3339`, in whole seconds.
+pub fn next_renewal(created_rfc3339: &str, now_unix: i64) -> Option<i64> {
+    use chrono::{Datelike, NaiveDate, Timelike};
+
+    let created = DateTime::parse_from_rfc3339(created_rfc3339).ok()?.with_timezone(&chrono::Utc);
+    let time = created.time().with_nanosecond(0)?;
+    let base = i64::from(created.year()) * 12 + i64::from(created.month0());
+    // Start close to `now`, one month early, so the loop is a few steps long.
+    let now_month = chrono::DateTime::from_timestamp(now_unix, 0)
+        .map(|now| i64::from(now.year()) * 12 + i64::from(now.month0()))?;
+    let first = (now_month - base - 1).max(1);
+    for months in first..first + 3 {
+        let index = base + months;
+        let year = i32::try_from(index.div_euclid(12)).ok()?;
+        let month = u32::try_from(index.rem_euclid(12)).ok()? + 1;
+        let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+        let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)?.pred_opt()?.day();
+        let date = NaiveDate::from_ymd_opt(year, month, created.day().min(last_day))?;
+        let instant = date.and_time(time).and_utc().timestamp();
+        if instant > now_unix {
+            return Some(instant);
+        }
+    }
+    None
+}
+
+/// Short plan name from the organization's rate-limit tier and type.
+pub fn plan_label(
+    rate_limit_tier: Option<&str>,
+    organization_type: Option<&str>,
+    subscription_type: Option<&str>,
+) -> String {
+    let tier = rate_limit_tier.unwrap_or("");
+    if tier.ends_with("max_5x") {
+        "max5x".to_owned()
+    } else if tier.ends_with("max_20x") {
+        "max20x".to_owned()
+    } else if organization_type == Some("claude_pro") || subscription_type == Some("pro") {
+        "pro".to_owned()
+    } else {
+        subscription_type.filter(|value| !value.is_empty()).unwrap_or("--").to_owned()
+    }
+}
+
 /// Identity of a saved Claude account, read from the profile's account.json
 /// and credentials.json.
 #[derive(Debug, Default, Clone)]
@@ -156,6 +201,46 @@ pub enum ExpiryLevel {
     Soon,
     /// The recorded end is in the past.
     Past,
+    /// The subscription is canceled or its payment failed.
+    Bad,
+}
+
+/// Table cell for "Plan until": the renewal date, or the end date of a
+/// canceled plan, or `past due`. Pro plans may be yearly, so their date is
+/// only approximate and gets a `~`.
+pub fn plan_until_label(
+    until: Option<i64>,
+    now: i64,
+    subscription_status: Option<&str>,
+    plan: Option<&str>,
+) -> (String, ExpiryLevel) {
+    let (text, level) = subscription_label(until, now);
+    let approx = plan == Some("pro") && until.is_some_and(|until| until > now);
+    let text = if approx { format!("~{text}") } else { text };
+    match subscription_status {
+        Some("past_due") => ("past due".into(), ExpiryLevel::Bad),
+        Some("canceled") if until.is_some_and(|until| until > now) => {
+            let date = text.split(" (").next().unwrap_or(&text);
+            (format!("ends {date}"), ExpiryLevel::Bad)
+        }
+        Some("canceled") => ("canceled".into(), ExpiryLevel::Bad),
+        _ => (text, level),
+    }
+}
+
+/// Age of a reading that is older than the cache would have kept, e.g.
+/// `4m ago`; `None` for a fresh one.
+pub fn stale_age_label(fetched_at: Option<i64>, now: i64) -> Option<String> {
+    let age = now - fetched_at?;
+    let ttl = i64::try_from(crate::config::get().cache.ttl).unwrap_or(i64::MAX);
+    if age <= ttl.saturating_add(5) {
+        return None;
+    }
+    Some(match age {
+        0..=3599 => format!("{}m ago", (age / 60).max(1)),
+        3600..=86_399 => format!("{}h ago", age / 3600),
+        _ => format!("{}d ago", age / 86_400),
+    })
 }
 
 /// Short text for a table cell, e.g. `10-11 (5d)`, plus its urgency.
@@ -206,6 +291,17 @@ pub fn read_profile(alias: &str) -> Result<Profile> {
     };
     let account = read("account.json")?;
     let credentials = read("credentials.json")?;
+    let label = plan_label(
+        account["organizationRateLimitTier"].as_str(),
+        account["organizationType"].as_str(),
+        credentials["claudeAiOauth"]["subscriptionType"].as_str(),
+    );
+    // Stripe renews a monthly plan on its creation day; other billing has no
+    // date Claude keeps locally.
+    let subscription_until = (account["billingType"].as_str() == Some("stripe_subscription"))
+        .then(|| account["subscriptionCreatedAt"].as_str())
+        .flatten()
+        .and_then(|created| next_renewal(created, crate::auth::now_unix_secs()));
     Ok(Profile {
         alias: alias.to_owned(),
         dir,
@@ -217,9 +313,8 @@ pub fn read_profile(alias: &str) -> Result<Profile> {
                     .context("account.json has no accountUuid")?
                     .to_owned(),
             ),
-            plan_type: credentials["claudeAiOauth"]["subscriptionType"]
-                .as_str()
-                .map(str::to_owned),
+            plan_type: (label != "--").then_some(label),
+            subscription_until,
             ..Default::default()
         },
     })
@@ -302,6 +397,10 @@ pub async fn fetch(
             return Ok(cached);
         }
     }
+    // A 429 pauses this alias: no request until Retry-After has passed.
+    if let Some(left_ms) = crate::cache::pause_left_ms(&profile.alias) {
+        return paused_answer(&profile.alias, left_ms);
+    }
     let client = crate::auth::build_http_client().map_err(|e| UsageError {
         summary: "HTTP client error".into(),
         detail: e.to_string(),
@@ -339,18 +438,55 @@ pub async fn fetch(
         _ => None,
     };
     let live_oauth = live_oauth.or(rechecked.as_ref());
-    let raw = crate::claude_api::usage_for_profile(
+    let endpoints = endpoints();
+    let (raw, token) = match crate::claude_api::usage_and_token_for_profile(
         &client,
-        &endpoints(),
+        &endpoints,
         &profile.dir,
         live_oauth.is_some(),
         live_oauth,
     )
     .await
-    .map_err(usage_error)?;
-    let usage = usage_info(raw);
+    {
+        Ok(fetched) => fetched,
+        Err(ApiError::RateLimited { retry_after }) => {
+            let wait = retry_after.map_or(DEFAULT_RETRY_AFTER_SECS, |after| after.as_secs());
+            let wait_ms = i64::try_from(wait.min(MAX_RETRY_AFTER_SECS) * 1000).unwrap_or(0);
+            crate::cache::pause_for_ms(&profile.alias, wait_ms);
+            return paused_answer(&profile.alias, wait_ms);
+        }
+        Err(error) => return Err(usage_error(error)),
+    };
+    let mut usage = usage_info(raw);
     crate::cache::put(&profile.alias, &usage);
+    // Same token, at most every 6 h; a failure never fails the row, and the
+    // token is never refreshed for it.
+    if crate::cache::profile_status_due(&profile.alias) {
+        let status = crate::claude_api::fetch_profile(&client, &endpoints, &token)
+            .await
+            .ok()
+            .and_then(|status| status.subscription_status);
+        crate::cache::put_profile_status(&profile.alias, status);
+    }
+    usage.subscription_status = crate::cache::profile_status(&profile.alias);
     Ok(usage)
+}
+
+/// Retry-After when the 429 carries none, and the longest pause honored.
+const DEFAULT_RETRY_AFTER_SECS: u64 = 300;
+const MAX_RETRY_AFTER_SECS: u64 = 86_400;
+
+/// The answer while an alias is paused after a 429: its last good reading
+/// (with its own old time), else an error that says how long to wait.
+fn paused_answer(alias: &str, left_ms: i64) -> Result<UsageInfo, UsageError> {
+    if let Some(last) = crate::cache::last_good(alias) {
+        return Ok(last);
+    }
+    let seconds = (left_ms + 999) / 1000;
+    Err(UsageError {
+        summary: format!("rate limited; retry in {seconds}s"),
+        detail: format!("Claude usage: rate limited, next request allowed in {seconds}s"),
+    })
 }
 
 /// Usage for every profile, in the same order, fetched concurrently.

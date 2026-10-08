@@ -519,8 +519,25 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             };
 
-            let (card_until, card_until_level) =
-                crate::claude_usage::subscription_label(entry.info.subscription_until, now);
+            // A reading older than the cache would keep shows its age.
+            let status_text = match &entry.usage {
+                UsageStatus::Loaded(u) => match crate::claude_usage::stale_age_label(u.fetched_at, now) {
+                    Some(age) => format!("{status_text} {}", age.trim_end_matches(" ago")),
+                    None => status_text,
+                },
+                _ => status_text,
+            };
+            let subscription_status = match &entry.usage {
+                UsageStatus::Loaded(u) => u.subscription_status.as_deref(),
+                _ => None,
+            };
+            let (until_text, until_level) = crate::claude_usage::plan_until_label(
+                entry.info.subscription_until,
+                now,
+                subscription_status,
+                entry.info.plan_type.as_deref(),
+            );
+            let (card_until, card_until_level) = (until_text.clone(), until_level);
             let dim = base().fg(DIM);
             cards.push(vec![
                 Line::from(vec![
@@ -544,10 +561,10 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(format!("  {status_text}"), base().fg(status_color)),
                     Span::styled(
                         format!("  until {card_until}"),
-                        base().fg(if card_until_level == crate::claude_usage::ExpiryLevel::Soon {
-                            C_YELLOW
-                        } else {
-                            DIM
+                        base().fg(match card_until_level {
+                            crate::claude_usage::ExpiryLevel::Soon => C_YELLOW,
+                            crate::claude_usage::ExpiryLevel::Bad => C_RED,
+                            _ => DIM,
                         }),
                     ),
                 ]),
@@ -575,10 +592,9 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                 cells.push(Cell::from(reset_5h).style(base().fg(reset_5h_color)));
             }
             cells.push(Cell::from(reset_7d).style(base().fg(reset_7d_color)));
-            let (until_text, until_level) =
-                crate::claude_usage::subscription_label(entry.info.subscription_until, now);
             let until_color = match until_level {
                 crate::claude_usage::ExpiryLevel::Soon => C_YELLOW,
+                crate::claude_usage::ExpiryLevel::Bad => C_RED,
                 crate::claude_usage::ExpiryLevel::Ok => C_GRAY,
                 _ => DIM,
             };
@@ -655,7 +671,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(text_widths.alias), // alias
         Constraint::Length(text_widths.email), // email
         Constraint::Length(text_widths.plan),  // plan
-        Constraint::Length(8),                 // status
+        Constraint::Length(10),                // status (+ age of an old reading)
     ];
     if show_5h {
         constraints.push(Constraint::Length(6)); // 5h %
@@ -665,7 +681,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         constraints.push(Constraint::Length(12)); // 5h reset
     }
     constraints.push(Constraint::Length(12)); // 7d reset
-    constraints.push(Constraint::Length(11)); // plan until
+    constraints.push(Constraint::Length(16)); // plan until ("ends ~10-20")
 
 
     let natural: u16 = constraints

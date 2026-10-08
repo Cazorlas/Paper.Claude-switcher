@@ -35,6 +35,8 @@ pub struct JsonAccount {
     pub workspace_name: Option<String>,
     /// End of the current paid period, unix seconds (as of the last token refresh)
     pub subscription_until: Option<i64>,
+    /// "active", "canceled", "past_due", ... from the profile endpoint
+    pub subscription_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -116,8 +118,13 @@ pub struct JsonError {
 
 // ── Conversion helpers ───────────────────────────────────
 
-pub fn account_to_json(info: &AccountInfo, api_plan: Option<&str>) -> JsonAccount {
+pub fn account_to_json(
+    info: &AccountInfo,
+    api_plan: Option<&str>,
+    subscription_status: Option<&str>,
+) -> JsonAccount {
     JsonAccount {
+        subscription_status: subscription_status.map(str::to_owned),
         email: info.email.clone(),
         plan: api_plan
             .map(|s| s.to_string())

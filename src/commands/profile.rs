@@ -24,8 +24,12 @@ impl Accounts {
         // The live plan is fresher than the one stored with the active profile.
         if let (Some(live), Some(active)) = (&live, &active) {
             if let Some(plan) = live.oauth["subscriptionType"].as_str() {
+                // A tier-exact name from account.json (max5x, max20x) is finer
+                // than the live "max".
                 for p in profiles.iter_mut().filter(|p| &p.alias == active) {
-                    p.info.plan_type = Some(plan.to_owned());
+                    if !matches!(p.info.plan_type.as_deref(), Some("max5x" | "max20x")) {
+                        p.info.plan_type = Some(plan.to_owned());
+                    }
                 }
             }
         }
@@ -150,10 +154,11 @@ pub(crate) async fn list_cmd(force: bool, json: bool) -> Result<()> {
                 Ok(u) => usage_to_json(Ok(u)),
                 Err(e) => usage_to_json(Err(&e.detail)),
             };
+            let status = usage_result.as_ref().ok().and_then(|u| u.subscription_status.as_deref());
             json_items.push(output::JsonProfileWithUsage {
                 alias: p.alias.clone(),
                 is_current,
-                account: account_to_json(&p.info, None),
+                account: account_to_json(&p.info, None, status),
                 usage: ju,
             });
         } else {
@@ -173,6 +178,18 @@ pub(crate) async fn list_cmd(force: bool, json: bool) -> Result<()> {
             }
             if let Some(plan) = p.info.plan_type.as_deref() {
                 print!("  {}", color::plan(plan, Some(plan)));
+            }
+            let status = usage_result.as_ref().ok().and_then(|u| u.subscription_status.as_deref());
+            let (until, level) = claude_usage::plan_until_label(
+                p.info.subscription_until,
+                auth::now_unix_secs(),
+                status,
+                p.info.plan_type.as_deref(),
+            );
+            match level {
+                claude_usage::ExpiryLevel::Unknown => {}
+                claude_usage::ExpiryLevel::Bad => print!("  {}", color::error(&until)),
+                _ => print!("  {}", color::dim(&format!("until {until}"))),
             }
             println!();
             match usage_result {
@@ -403,7 +420,11 @@ async fn best_cmd(json: bool) -> Result<()> {
     if json {
         print_json(&output::JsonBest {
             switched_to: best_alias.clone(),
-            account: account_to_json(&info, best_usage.plan_type.as_deref()),
+            account: account_to_json(
+                &info,
+                best_usage.plan_type.as_deref(),
+                best_usage.subscription_status.as_deref(),
+            ),
             usage: usage_to_json(Ok(&best_usage)),
             score: best_score,
             mode: "unified".to_string(),

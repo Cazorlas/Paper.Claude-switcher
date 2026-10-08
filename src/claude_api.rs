@@ -164,6 +164,63 @@ pub async fn fetch_usage(
     })
 }
 
+/// What `/api/oauth/profile` says about the organization's subscription.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileStatus {
+    pub subscription_status: Option<String>,
+    pub subscription_created_at: Option<String>,
+    pub rate_limit_tier: Option<String>,
+    pub organization_type: Option<String>,
+}
+
+pub async fn fetch_profile(
+    client: &reqwest::Client,
+    ep: &Endpoints,
+    access_token: &str,
+) -> Result<ProfileStatus, UsageError> {
+    let response = client
+        .get(format!(
+            "{}/api/oauth/profile",
+            ep.api_base.trim_end_matches('/')
+        ))
+        .bearer_auth(access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header(
+            "User-Agent",
+            concat!("paper-claude-switch/", env!("CARGO_PKG_VERSION")),
+        )
+        .send()
+        .await
+        .map_err(|error| UsageError::Network(error.to_string()))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(UsageError::RateLimited { retry_after: None });
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(UsageError::Unauthorized);
+    }
+    if !status.is_success() {
+        return Err(UsageError::Http(status.as_u16()));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| UsageError::Network(error.to_string()))?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| UsageError::BadResponse(format!("invalid profile JSON: {error}")))?;
+    let organization = body
+        .get("organization")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| UsageError::BadResponse("profile has no organization".to_owned()))?;
+    let text = |key: &str| organization.get(key).and_then(Value::as_str).map(str::to_owned);
+    Ok(ProfileStatus {
+        subscription_status: text("subscription_status"),
+        subscription_created_at: text("subscription_created_at"),
+        rate_limit_tier: text("rate_limit_tier"),
+        organization_type: text("organization_type"),
+    })
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RefreshOutcome {
     Refreshed(Value),
@@ -261,6 +318,20 @@ pub async fn usage_for_profile(
     is_active: bool,
     live_oauth: Option<&Value>,
 ) -> Result<ClaudeUsage, UsageError> {
+    usage_and_token_for_profile(client, ep, profile_dir, is_active, live_oauth)
+        .await
+        .map(|(usage, _token)| usage)
+}
+
+/// Same as `usage_for_profile`, and also returns the access token that was
+/// accepted, so a follow-up request can reuse it without another refresh.
+pub async fn usage_and_token_for_profile(
+    client: &reqwest::Client,
+    ep: &Endpoints,
+    profile_dir: &Path,
+    is_active: bool,
+    live_oauth: Option<&Value>,
+) -> Result<(ClaudeUsage, String), UsageError> {
     let now = now_ms().map_err(UsageError::BadResponse)?;
     if is_active {
         // Claude Code owns this refresh lineage; never rotate it from here.
@@ -268,7 +339,8 @@ pub async fn usage_for_profile(
         if expires_at(oauth)? <= now {
             return Err(UsageError::TokenExpired);
         }
-        return fetch_usage(client, ep, access_token(oauth)?).await;
+        let token = access_token(oauth)?;
+        return Ok((fetch_usage(client, ep, token).await?, token.to_owned()));
     }
 
     let path = profile_dir.join("credentials.json");
@@ -298,7 +370,8 @@ pub async fn usage_for_profile(
         crate::auth::atomic_write_private(&path, &bytes)
             .map_err(|error| UsageError::BadResponse(format!("persisting rotated credentials: {error}")))?;
     }
-    fetch_usage(client, ep, access_token(&oauth)?).await
+    let token = access_token(&oauth)?;
+    Ok((fetch_usage(client, ep, token).await?, token.to_owned()))
 }
 
 fn expires_at(oauth: &Value) -> Result<i64, UsageError> {

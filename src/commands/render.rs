@@ -179,8 +179,9 @@ pub(crate) fn print_usage_line(u: &usage::UsageInfo) {
         );
     }
     print_additional_pool_lines(&u.additional_limits);
-
-
+    if let Some(age) = crate::claude_usage::stale_age_label(u.fetched_at, crate::auth::now_unix_secs()) {
+        println!("  {}", color::dim(&format!("\u{b7} {age}")));
+    }
 }
 
 #[cfg(test)]

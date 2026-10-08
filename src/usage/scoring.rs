@@ -338,6 +338,7 @@ mod tests {
             rate_limit_reached_type: None,
             individual_limit: None,
             additional_limits: vec![],
+            subscription_status: None,
         }
     }
 
