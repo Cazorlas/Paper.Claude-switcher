@@ -5,12 +5,12 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please do **not** paste `auth.json`, tokens or profile files. Run commands with `--debug` and redact emails if you like.
+        Please do **not** paste `.credentials.json`, tokens or profile files. Run commands with `--debug` and redact emails if you like.
   - type: input
     id: version
     attributes:
       label: Version
-      description: Output of `paper-codex-switch --version`
+      description: Output of `paper-claude-switch --version`
     validations: { required: true }
   - type: input
     id: system
@@ -19,10 +19,10 @@ body:
       placeholder: Windows 11, npm i -g
     validations: { required: true }
   - type: input
-    id: codex
+    id: claude
     attributes:
-      label: Codex CLI version
-      description: Output of `codex --version` (or `paper-codex-switch doctor`)
+      label: Claude Code version
+      description: Output of `claude --version` (or `paper-claude-switch doctor`)
   - type: textarea
     id: what
     attributes:

@@ -13,7 +13,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      VERIFIED_CODEX_MINOR: "160"
     steps:
       - name: Run checks
         run: |
@@ -23,9 +22,9 @@ jobs:
 
           # 1. latest GitHub release vs npm, and its four assets
           tag=$(gh api "repos/$REPO/releases/latest" --jq .tag_name)
-          npm_latest=$(curl -fsS https://registry.npmjs.org/paper-codex-switch | jq -r '."dist-tags".latest')
+          npm_latest=$(curl -fsS https://registry.npmjs.org/paper-claude-switch | jq -r '."dist-tags".latest')
           [ "v$npm_latest" = "$tag" ] || add "npm latest is **$npm_latest** but the latest release is **$tag**"
-          for a in paper-codex-switch-windows-x64.exe paper-codex-switch-macos-x64 paper-codex-switch-macos-arm64 paper-codex-switch-linux-x64; do
+          for a in paper-claude-switch-windows-x64.exe paper-claude-switch-macos-x64 paper-claude-switch-macos-arm64 paper-claude-switch-linux-x64; do
             gh api "repos/$REPO/releases/latest" --jq '.assets[].name' | grep -qx "$a" || add "release $tag is missing asset \`$a\`"
           done
 
@@ -35,16 +34,11 @@ jobs:
             [ "$c" = "success" ] || add "latest \`$wf\` run concluded **$c**"
           done
 
-          # 3. upstream Codex CLI moved past the version we verified against
-          cx=$(gh api repos/openai/codex/releases/latest --jq .tag_name | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          minor=$(echo "$cx" | cut -d. -f2)
-          [ "${minor:-0}" -le "$VERIFIED_CODEX_MINOR" ] || add "Codex CLI **$cx** is newer than the verified 0.$VERIFIED_CODEX_MINOR.x; check auth.json, login and usage endpoint changes, then raise VERIFIED_CODEX_MINOR in health.yml"
-
-          # 4. open bug reports
+          # 3. open bug reports
           n=$(gh api "repos/$REPO/issues?state=open&labels=bug&per_page=100" --jq 'length')
           [ "$n" -eq 0 ] || add "$n open bug report(s)"
 
-          echo "release=$tag npm=$npm_latest codex=$cx"
+          echo "release=$tag npm=$npm_latest"
           if [ -z "$problems" ]; then echo "ALL GOOD"; exit 0; fi
           printf 'Weekly health check found:\n\n%s\nRun: %s/%s/actions/runs/%s\n' "$problems" "$GITHUB_SERVER_URL" "$REPO" "$GITHUB_RUN_ID" > body.md
           gh label create -R "$REPO" health --color D93F0B --description "weekly health check" --force >/dev/null
