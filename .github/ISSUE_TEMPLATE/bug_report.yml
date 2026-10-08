@@ -1,0 +1,36 @@
+name: Bug report
+description: Something does not work
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please do **not** paste `auth.json`, tokens or profile files. Run commands with `--debug` and redact emails if you like.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `paper-codex-switch --version`
+    validations: { required: true }
+  - type: input
+    id: system
+    attributes:
+      label: OS and install method
+      placeholder: Windows 11, npm i -g
+    validations: { required: true }
+  - type: input
+    id: codex
+    attributes:
+      label: Codex CLI version
+      description: Output of `codex --version` (or `paper-codex-switch doctor`)
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran and their output
+      render: shell

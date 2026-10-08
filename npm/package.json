@@ -1,0 +1,13 @@
+{
+  "name": "paper-codex-switch",
+  "version": "1.0.11",
+  "description": "Multi-account switcher for OpenAI Codex CLI with automatic swap before the usage limit",
+  "license": "MIT",
+  "repository": "github:Cazorlas/Paper.Codex-switcher",
+  "bin": { "paper-codex-switch": "bin/cli.js" },
+  "scripts": { "postinstall": "node install.js" },
+  "files": ["bin/cli.js", "install.js", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "engines": { "node": ">=18" },
+  "os": ["win32", "darwin", "linux"],
+  "keywords": ["codex", "openai", "account", "switcher", "cli"]
+}

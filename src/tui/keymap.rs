@@ -1,0 +1,315 @@
+/// Single source of truth for TUI keybindings.
+///
+/// Status bar and Help popup both render from this list.
+/// Adding/changing a key here updates every surface.
+///
+/// Binding rules (letter must match the verb shown in the UI):
+/// - Same action uses the same key on every tab.
+/// - `o` launches Codex. `l` is re-login on Accounts (and batch). Never bind
+///   launch to `l`: that letter already means login.
+/// - Enter opens the selected row (Accounts: action menu, Providers: launch
+///   picker). `e` edits a provider. In a dialog, Enter confirms and Esc cancels.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Navigation,
+    Selection,
+    Account,
+    Batch,
+    Settings,
+    Logs,
+    Global,
+}
+
+impl Section {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Section::Navigation => "Navigation",
+            Section::Selection => "Selection",
+            Section::Account => "Accounts tab",
+            Section::Batch => "Batch actions  (open via Enter when accounts marked)",
+            Section::Settings => "Settings tab",
+            Section::Logs => "Logs tab",
+            Section::Global => "Global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Binding {
+    pub keys: &'static str,
+    pub section: Section,
+    pub label: &'static str,
+    pub in_status_bar: bool,
+}
+
+/// Master keymap. Order matters: status bar renders top entries first;
+/// Help popup groups by section in the order encountered.
+pub const KEYMAP: &[Binding] = &[
+    // Navigation
+    Binding {
+        keys: "j / k / ↑ ↓",
+        section: Section::Account,
+        label: "move selection",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "/",
+        section: Section::Account,
+        label: "search",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "tab / shift+tab",
+        section: Section::Navigation,
+        label: "next / previous tab (Accounts / Settings / Logs)",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "s",
+        section: Section::Account,
+        label: "cycle sort (name / quota / status)",
+        in_status_bar: false,
+    },
+    // Selection
+    Binding {
+        keys: "space",
+        section: Section::Selection,
+        label: "toggle mark",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "esc",
+        section: Section::Selection,
+        label: "clear marks / search / popup",
+        in_status_bar: false,
+    },
+    // Account actions. Only enter, o and u work directly on the list (r there
+    // refreshes all visible accounts, see Global below); the rest are keys of
+    // the selected-account menu that Enter opens.
+    Binding {
+        keys: "enter",
+        section: Section::Account,
+        label: "open selected account actions",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "r",
+        section: Section::Account,
+        label: "refresh this account (in the Enter menu)",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "o",
+        section: Section::Account,
+        label: "launch Codex",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "u",
+        section: Section::Account,
+        label: "use (switch to)",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "l",
+        section: Section::Account,
+        label: "re-login (in the Enter menu)",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "n",
+        section: Section::Account,
+        label: "rename (in the Enter menu)",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "d",
+        section: Section::Account,
+        label: "delete (in the Enter menu)",
+        in_status_bar: false,
+    },
+    // Batch actions
+    Binding {
+        keys: "r",
+        section: Section::Batch,
+        label: "refresh selected",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "l",
+        section: Section::Batch,
+        label: "re-login selected (sequential)",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "d",
+        section: Section::Batch,
+        label: "delete selected",
+        in_status_bar: false,
+    },
+    // Providers tab
+    // Settings tab
+    Binding {
+        keys: "j / k / ↑ ↓",
+        section: Section::Settings,
+        label: "move field",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "enter / space",
+        section: Section::Settings,
+        label: "edit or toggle the focused field",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "← / →",
+        section: Section::Settings,
+        label: "toggle boolean options",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "s",
+        section: Section::Settings,
+        label: "save config.toml",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "esc",
+        section: Section::Settings,
+        label: "cancel the current field edit",
+        in_status_bar: false,
+    },
+    // Logs tab
+    Binding {
+        keys: "j / k / ↑ ↓ / PgUp PgDn",
+        section: Section::Logs,
+        label: "scroll session logs",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "end",
+        section: Section::Logs,
+        label: "jump to latest log",
+        in_status_bar: false,
+    },
+    // Global
+    Binding {
+        keys: "a",
+        section: Section::Account,
+        label: "add new account",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "r",
+        section: Section::Account,
+        label: "refresh visible accounts",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "t",
+        section: Section::Account,
+        label: "toggle auto-refresh",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "i",
+        section: Section::Account,
+        label: "show / hide account detail panel",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "h",
+        section: Section::Global,
+        label: "show this help (main view)",
+        in_status_bar: true,
+    },
+    Binding {
+        keys: "mouse",
+        section: Section::Global,
+        label: "click tabs/rows; double-click rows opens menus; wheel scrolls logs/help/menus",
+        in_status_bar: false,
+    },
+    Binding {
+        keys: "q",
+        section: Section::Global,
+        label: "quit (main view)",
+        in_status_bar: true,
+    },
+];
+
+/// Build help text grouped by section. Returns a list of (heading, lines).
+pub fn help_sections_for(
+    active: Section,
+) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    let mut result: Vec<(&'static str, Vec<(&'static str, &'static str)>)> = Vec::new();
+    for binding in KEYMAP.iter().filter(|binding| {
+        matches!(binding.section, Section::Navigation | Section::Global)
+            || binding.section == active
+            || (active == Section::Account
+                && matches!(binding.section, Section::Selection | Section::Batch))
+    }) {
+        let heading = binding.section.label();
+        if let Some((_, items)) = result.iter_mut().find(|(h, _)| *h == heading) {
+            items.push((binding.keys, binding.label));
+        } else {
+            result.push((heading, vec![(binding.keys, binding.label)]));
+        }
+    }
+    result
+}
+
+/// Status bar items in display order.
+pub fn status_bar_items() -> Vec<(&'static str, &'static str)> {
+    KEYMAP
+        .iter()
+        .filter(|b| b.in_status_bar)
+        .map(|b| (b.keys, b.label))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn status_bar_surfaces_core_account_actions() {
+        let items = super::status_bar_items();
+        for (key, verb) in [("a", "add"), ("i", "detail"), ("o", "launch")] {
+            assert!(
+                items
+                    .iter()
+                    .any(|(keys, label)| *keys == key && label.to_ascii_lowercase().contains(verb)),
+                "missing {key} {verb} from {items:?}"
+            );
+        }
+    }
+
+
+
+
+
+    #[test]
+    fn help_labels_q_and_h_as_main_view_shortcuts() {
+        for key in ["h", "q"] {
+            let binding = super::KEYMAP
+                .iter()
+                .find(|binding| binding.section == super::Section::Global && binding.keys == key)
+                .unwrap_or_else(|| panic!("missing global {key} binding"));
+            assert!(
+                binding.label.contains("main view"),
+                "{key} must not claim to apply inside forms or popups: {}",
+                binding.label
+            );
+        }
+    }
+
+    #[test]
+    fn use_action_is_visible_in_the_accounts_status_bar() {
+        let items = super::status_bar_items();
+        assert!(
+            items.iter().any(|(keys, label)| {
+                *keys == "u" && label.to_ascii_lowercase().contains("use")
+            }),
+            "Accounts status bar must expose the real use shortcut: {items:?}"
+        );
+    }
+}

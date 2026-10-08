@@ -1,0 +1,2015 @@
+use crossterm::event::KeyCode;
+use ratatui::{
+    Frame,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState},
+};
+
+use super::app::{App, Tab, UsageStatus};
+use super::hitmap::OverlayClick;
+use super::keymap;
+use super::popup;
+use super::theme::{
+    BG, C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_WHITE, C_YELLOW, DIM, base, highlight,
+};
+use crate::jwt::PlanKind;
+use crate::output::{
+    format_local_time, format_reset_short, format_reset_time,
+};
+use crate::usage::{UsageInfo, is_available};
+
+fn status_message_color(is_error: bool) -> Color {
+    if is_error { C_RED } else { C_CYAN }
+}
+
+pub fn render(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    app.hitmap.clear();
+
+    // Paint the entire area with a solid background first
+    f.render_widget(Block::default().style(base()), area);
+
+    let status_height = status_bar_height(app, area.width);
+
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),                    // tab bar
+            Constraint::Min(6),                       // active tab content
+            Constraint::Length(status_height as u16), // status bar
+        ])
+        .split(area);
+
+    render_tab_bar(f, app, vertical[0]);
+
+    match app.active_tab {
+        Tab::Accounts => {
+            let content = vertical[1];
+            let detail_height = if app.detail_visible {
+                detail_panel_height(app).min(content.height.saturating_sub(6))
+            } else {
+                0
+            };
+            let rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(6),                // account list
+                    Constraint::Length(detail_height), // detail panel
+                ])
+                .split(content);
+            render_account_table(f, app, rows[0]);
+            if app.detail_visible {
+                render_detail_panel(f, app, rows[1]);
+            }
+        }
+        Tab::Settings => {
+            super::settings::render_settings_tab(
+                f,
+                &app.settings,
+                vertical[1],
+                &mut app.hitmap,
+                None,
+            )
+        }
+        Tab::Logs => render_logs(f, app, vertical[1]),
+    }
+
+    render_status_bar(f, app, vertical[2]);
+
+    // Overlays (rendered last, on top of everything).
+    // Help popup takes top priority since the user invoked it explicitly.
+    let active_tab = app.active_tab;
+    if let Some(state) = app.help_popup.as_mut() {
+        let panel = render_help_popup(f, state, active_tab, area, None);
+        app.hitmap.overlay = match panel {
+            Some(panel) => super::hitmap::OverlayHit::Dismissible { panel },
+            None => super::hitmap::OverlayHit::Modal,
+        };
+    } else if app.menu.is_some() {
+        let rendered = app.menu.as_mut().and_then(|menu| menu.render(f, area));
+        app.hitmap.menu_actions = rendered
+            .as_ref()
+            .map(|menu| menu.actions.clone())
+            .unwrap_or_default();
+        app.hitmap.overlay = match rendered {
+            Some(menu) => super::hitmap::OverlayHit::Dismissible { panel: menu.panel },
+            None => super::hitmap::OverlayHit::Modal,
+        };
+    } else if app.confirm.is_some()
+        || app.rename.is_some()
+        || app.search_active
+        || (app.active_tab == Tab::Settings && app.settings.is_editing())
+    {
+        app.hitmap.overlay = super::hitmap::OverlayHit::Modal;
+    }
+}
+
+fn render_logs(f: &mut Frame, app: &mut App, area: Rect) {
+    app.hitmap.logs = Some(area);
+    let inner_width = area.width.saturating_sub(2).max(1);
+    let previous_revision = (app.log_render_width == inner_width)
+        .then_some(app.log_render_revision)
+        .flatten();
+    if let Some((revision, lines)) = app.log_writer.lines_if_changed(previous_revision) {
+        app.log_render_revision = Some(revision);
+        app.log_render_width = inner_width;
+        app.log_visual_lines = if lines.is_empty() {
+            vec!["No logs in this session.".to_string()]
+        } else {
+            hard_wrap_log_lines(&lines, inner_width)
+        };
+    }
+    let visual_lines = &app.log_visual_lines;
+    let visible_rows = usize::from(area.height.saturating_sub(2)).max(1);
+    let max_scroll = visual_lines.len().saturating_sub(visible_rows);
+    let bottom_offset = usize::from(app.log_scroll).min(max_scroll);
+    app.log_scroll = u16::try_from(bottom_offset).unwrap_or(u16::MAX);
+    let end = visual_lines.len().saturating_sub(bottom_offset);
+    let start = end.saturating_sub(visible_rows);
+    let text = visual_lines[start..end].join("\n");
+    let block = Block::default()
+        .title(" Session logs ")
+        .borders(Borders::ALL)
+        .border_style(base().fg(C_BLUE))
+        .style(base());
+    f.render_widget(
+        Paragraph::new(text).style(base().fg(C_GRAY)).block(block),
+        area,
+    );
+}
+
+fn hard_wrap_log_lines(lines: &[String], width: u16) -> Vec<String> {
+    let width = usize::from(width.max(1));
+    let mut wrapped = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+        let mut row = String::new();
+        let mut row_width: usize = 0;
+        for ch in line.chars() {
+            let ch_width = display_width(ch.encode_utf8(&mut [0; 4]));
+            if row_width > 0 && row_width.saturating_add(ch_width) > width {
+                wrapped.push(std::mem::take(&mut row));
+                row_width = 0;
+            }
+            row.push(ch);
+            row_width = row_width.saturating_add(ch_width);
+        }
+        wrapped.push(row);
+    }
+    wrapped
+}
+
+fn render_help_popup(
+    f: &mut Frame,
+    state: &mut popup::PopupState,
+    active_tab: Tab,
+    area: ratatui::layout::Rect,
+    upgrade_instructions: Option<&[String]>,
+) -> Option<Rect> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let key_style = base().fg(C_YELLOW).add_modifier(Modifier::BOLD);
+    let label_style = base().fg(C_WHITE);
+    let heading_style = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
+    let dim_style = base().fg(DIM);
+
+    if let Some(instructions) = upgrade_instructions {
+        for instruction in instructions {
+            lines.push(Line::from(Span::styled(
+                instruction.clone(),
+                base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    // Compute key column width for alignment within section
+    let active_section = match active_tab {
+        Tab::Accounts => keymap::Section::Account,
+        Tab::Settings => keymap::Section::Settings,
+        Tab::Logs => keymap::Section::Logs,
+    };
+    let groups = keymap::help_sections_for(active_section);
+    let key_col = groups
+        .iter()
+        .flat_map(|(_, items)| items.iter())
+        .map(|(k, _)| display_width(k))
+        .max()
+        .unwrap_or(8);
+
+
+    for (i, (heading, items)) in groups.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            (*heading).to_string(),
+            heading_style,
+        )));
+        for (k, label) in items {
+            let pad = key_col.saturating_sub(display_width(k));
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled("  ", base()));
+            spans.push(Span::styled((*k).to_string(), key_style));
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), base()));
+            }
+            spans.push(Span::styled("  ", base()));
+            spans.push(Span::styled((*label).to_string(), label_style));
+            lines.push(Line::from(spans));
+        }
+    }
+    if active_tab == Tab::Accounts {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Commands (run in a terminal)".to_string(),
+            heading_style,
+        )));
+        for (cmd, what) in [
+            ("list", "usage of every account, numbered"),
+            ("use [n|alias]", "switch to the best account, or to number n / alias"),
+            ("login [alias]", "add an account (--device on a headless machine)"),
+            ("auto", "switch automatically near the limit; stop with Ctrl+C or close the window"),
+            ("launch --auto-swap", "run Codex and move the session to a better account at the limit"),
+            ("delete / restore", "remove an account / bring a deleted one back"),
+            ("self-update", "update to the newest version"),
+            ("uninstall", "remove the program (asks before deleting your data)"),
+        ] {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            spans.push(Span::styled("  ", base()));
+            spans.push(Span::styled(cmd.to_string(), key_style));
+            spans.push(Span::styled("  ", base()));
+            spans.push(Span::styled(what.to_string(), label_style));
+            lines.push(Line::from(spans));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  esc / q / h to close \u{2022} j k arrows / PgUp PgDn / mouse wheel to scroll",
+        dim_style,
+    )));
+
+    popup::render_popup(f, "Help", &lines, state, area).map(|layout| layout.panel)
+}
+
+fn display_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TableTextWidths {
+    alias: u16,
+    email: u16,
+    plan: u16,
+}
+
+fn table_text_widths(
+    total_width: u16,
+    aliases: &[&str],
+    emails: &[&str],
+    plans: &[&str],
+    show_5h: bool,
+) -> TableTextWidths {
+    let desired = |header: &str, values: &[&str]| {
+        values
+            .iter()
+            .map(|value| u16::try_from(display_width(value)).unwrap_or(u16::MAX))
+            .chain(std::iter::once(
+                u16::try_from(display_width(header)).unwrap_or(u16::MAX),
+            ))
+            .max()
+            .unwrap_or(0)
+    };
+    let mut widths = TableTextWidths {
+        alias: desired("Alias", aliases).max(5),
+        email: desired("Email", emails).max(5),
+        plan: desired("Plan", plans).max(4),
+    };
+
+    // Base borders, spacing, marker and fixed columns consume 55 cells. The
+    // optional 5h pair and Credits column add their widths plus spacing.
+    let fixed_width = 47 + u16::from(show_5h) * 20;
+    let budget = total_width.saturating_sub(fixed_width).max(14);
+    let total = u32::from(widths.alias) + u32::from(widths.email) + u32::from(widths.plan);
+    let mut excess = total.saturating_sub(u32::from(budget));
+    for (width, minimum) in [
+        (&mut widths.email, 5_u16),
+        (&mut widths.plan, 4_u16),
+        (&mut widths.alias, 5_u16),
+    ] {
+        let shrink = excess.min(u32::from(width.saturating_sub(minimum)));
+        *width -= shrink as u16;
+        excess -= shrink;
+    }
+    widths
+}
+
+fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.accounts.is_empty() {
+        let block = Block::default()
+            .title(" paper-claude-switch ")
+            .borders(Borders::ALL)
+            .border_style(base().fg(C_BLUE))
+            .style(base());
+        let hint = Paragraph::new(Line::from(vec![
+            Span::styled("No accounts yet. Press ", base().fg(DIM)),
+            Span::styled("a", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(" to add one, or ", base().fg(DIM)),
+            Span::styled("q", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(" to quit.", base().fg(DIM)),
+        ]))
+        .block(block)
+        .alignment(ratatui::layout::Alignment::Center);
+        f.render_widget(hint, area);
+        return;
+    }
+
+    let show_5h = app
+        .accounts
+        .iter()
+        .any(|entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.primary.is_some()));
+    let hdr = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
+    let mut header_cells = vec![
+        Cell::from(" ").style(base().fg(DIM)),
+        Cell::from("Alias").style(hdr),
+        Cell::from("Email").style(hdr),
+        Cell::from("Plan").style(hdr),
+        Cell::from("Status").style(hdr),
+    ];
+    if show_5h {
+        header_cells.push(Cell::from("5h").style(hdr));
+    }
+    header_cells.push(Cell::from("7d").style(hdr));
+    if show_5h {
+        header_cells.push(Cell::from("5h Reset").style(hdr));
+    }
+    header_cells.push(Cell::from("7d Reset").style(hdr));
+    header_cells.push(Cell::from("Plan until").style(hdr));
+
+    let header = Row::new(header_cells).height(1);
+
+    let mut rows: Vec<Row> = Vec::new();
+    let mut cards: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut render_selected: usize = 0;
+    for (view_i, &acc_i) in app.view_indices.iter().enumerate() {
+        let entry = &app.accounts[acc_i];
+        let main_row = {
+            let is_marked = app.marked.contains(&entry.alias);
+            let marker = if is_marked {
+                ">"
+            } else if entry.is_current {
+                "*"
+            } else {
+                " "
+            };
+            let marker_style = if is_marked {
+                base().fg(C_YELLOW).add_modifier(Modifier::BOLD)
+            } else if entry.is_current {
+                base().fg(C_GREEN).add_modifier(Modifier::BOLD)
+            } else {
+                base()
+            };
+
+            let is_selected = view_i == app.selected;
+            let row_style = if is_selected {
+                base().fg(C_WHITE).add_modifier(Modifier::BOLD)
+            } else {
+                base().fg(C_GRAY)
+            };
+
+            let email = entry.info.email.as_deref().unwrap_or("--").to_string();
+            let api_plan = if let UsageStatus::Loaded(u) = &entry.usage {
+                u.plan_type.as_deref()
+            } else {
+                None
+            };
+            let effective_plan = api_plan.or(entry.info.plan_type.as_deref());
+            let plan_label = entry.info.plan_label_with(effective_plan);
+            let plan_style = plan_color(effective_plan, is_selected);
+
+            let now = crate::auth::now_unix_secs();
+
+            let (
+                status_text,
+                status_color,
+                pct_5h,
+                pct_7d,
+                reset_5h,
+                reset_5h_color,
+                reset_7d,
+                reset_7d_color,
+            ): (
+                String,
+                Color,
+                String,
+                String,
+                String,
+                Color,
+                String,
+                Color,
+            ) = match &entry.usage {
+                UsageStatus::Idle => (
+                    "--".into(),
+                    DIM,
+                    "--".into(),
+                    "--".into(),
+                    "--".into(),
+                    DIM,
+                    "--".into(),
+                    DIM,
+                ),
+                UsageStatus::Loading => (
+                    "...".into(),
+                    C_YELLOW,
+                    "...".into(),
+                    "...".into(),
+                    "loading".into(),
+                    DIM,
+                    "loading".into(),
+                    DIM,
+                ),
+                UsageStatus::Error(_) => (
+                    "Error".into(),
+                    C_RED,
+                    "Err".into(),
+                    "Err".into(),
+                    "--".into(),
+                    DIM,
+                    "--".into(),
+                    DIM,
+                ),
+                UsageStatus::Loaded(u) => {
+                    let refreshing = app.is_refreshing(&entry.alias);
+                    let over_5h = u.primary.as_ref().is_some_and(|w| {
+                        let used = w.used_percent.unwrap_or(0.0);
+                        // Suppress pace warning when usage is negligible — a fresh window
+                        // always shows used > pace near t=0, which is noise not a real warning.
+                        used >= 10.0
+                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_5H_SECS)
+                                .is_some_and(|pace| used > pace)
+                    });
+                    let over_7d = u.secondary.as_ref().is_some_and(|w| {
+                        let used = w.used_percent.unwrap_or(0.0);
+                        used >= 10.0
+                            && crate::usage::visible_pace_percent(w, crate::usage::WINDOW_7D_SECS)
+                                .is_some_and(|pace| used > pace)
+                    });
+                    let p5 = u
+                        .primary
+                        .as_ref()
+                        .and_then(|w| w.used_percent)
+                        .map(|p| {
+                            let s = format!("{:.0}%", (100.0 - p).max(0.0));
+                            if over_5h { format!("{s}!") } else { s }
+                        })
+                        .unwrap_or_else(|| "--".into());
+                    let p7 = u
+                        .secondary
+                        .as_ref()
+                        .and_then(|w| w.used_percent)
+                        .map(|p| {
+                            let s = format!("{:.0}%", (100.0 - p).max(0.0));
+                            if over_7d { format!("{s}!") } else { s }
+                        })
+                        .unwrap_or_else(|| "--".into());
+                    let r5_ts = u.primary.as_ref().and_then(|w| w.resets_at);
+                    let r5 = r5_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
+                    let r5c = r5_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
+                    let r7_ts = u.secondary.as_ref().and_then(|w| w.resets_at);
+                    let r7 = r7_ts.map(format_reset_short).unwrap_or_else(|| "--".into());
+                    let r7c = r7_ts.map(|ts| reset_color(ts - now)).unwrap_or(DIM);
+                    if refreshing {
+                        (
+                            "Refresh".into(),
+                            C_YELLOW,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                        )
+                    } else if is_available(u) {
+                        (
+                            "OK".into(),
+                            C_GREEN,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                        )
+                    } else {
+                        (
+                            "Limited".into(),
+                            C_RED,
+                            p5,
+                            p7,
+                            r5,
+                            r5c,
+                            r7,
+                            r7c,
+                        )
+                    }
+                }
+            };
+
+            let (card_until, card_until_level) =
+                crate::jwt::subscription_label(entry.info.subscription_until, now);
+            let dim = base().fg(DIM);
+            cards.push(vec![
+                Line::from(vec![
+                    Span::styled(format!("{marker} "), marker_style),
+                    Span::styled(format!("{}. {}", view_i + 1, entry.alias), row_style),
+                    Span::raw("  "),
+                    Span::styled(format!("[{plan_label}]"), plan_style),
+                ]),
+                Line::from(Span::styled(format!("  {email}"), dim)),
+                Line::from(vec![
+                    Span::styled("  5h ", dim),
+                    Span::styled(format!("{pct_5h} left"), usage_pct_style(&pct_5h, is_selected)),
+                    Span::styled(format!("  resets {reset_5h}"), base().fg(reset_5h_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  7d ", dim),
+                    Span::styled(format!("{pct_7d} left"), usage_pct_style(&pct_7d, is_selected)),
+                    Span::styled(format!("  resets {reset_7d}"), base().fg(reset_7d_color)),
+                ]),
+                Line::from(vec![
+                    Span::styled(format!("  {status_text}"), base().fg(status_color)),
+                    Span::styled(
+                        format!("  until {card_until}"),
+                        base().fg(if card_until_level == crate::jwt::ExpiryLevel::Soon {
+                            C_YELLOW
+                        } else {
+                            DIM
+                        }),
+                    ),
+                ]),
+                Line::from(""),
+            ]);
+
+            let mut cells = vec![
+                Cell::from(Span::styled(marker, marker_style)),
+                Cell::from(entry.alias.clone()).style(row_style),
+                Cell::from(email).style(row_style),
+                Cell::from(plan_label).style(plan_style),
+                Cell::from(status_text).style(base().fg(status_color).add_modifier(
+                    if is_selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    },
+                )),
+            ];
+            if show_5h {
+                cells.push(Cell::from(pct_5h.clone()).style(usage_pct_style(&pct_5h, is_selected)));
+            }
+            cells.push(Cell::from(pct_7d.clone()).style(usage_pct_style(&pct_7d, is_selected)));
+            if show_5h {
+                cells.push(Cell::from(reset_5h).style(base().fg(reset_5h_color)));
+            }
+            cells.push(Cell::from(reset_7d).style(base().fg(reset_7d_color)));
+            let (until_text, until_level) =
+                crate::jwt::subscription_label(entry.info.subscription_until, now);
+            let until_color = match until_level {
+                crate::jwt::ExpiryLevel::Soon => C_YELLOW,
+                crate::jwt::ExpiryLevel::Ok => C_GRAY,
+                _ => DIM,
+            };
+            cells.push(Cell::from(until_text).style(base().fg(until_color)));
+        
+            Row::new(cells).height(1)
+        };
+
+        if view_i == app.selected {
+            render_selected = rows.len();
+        }
+        rows.push(main_row);
+    }
+
+    let loading_count = app.loading_count();
+    let mut title = if let Some(s) = &app.search {
+        format!(
+            " Accounts ({}/{}) [/{s}]",
+            app.view_indices.len(),
+            app.accounts.len(),
+            s = s.query
+        )
+    } else {
+        format!(" Accounts ({})", app.accounts.len())
+    };
+    if loading_count > 0 {
+        title.push_str(&format!(" -- fetching {}...", loading_count));
+    }
+    if !app.marked.is_empty() {
+        title.push_str(&format!(" [{} marked]", app.marked.len()));
+    }
+    if let Some(secs) = app.auto_refresh_remaining_secs() {
+        title.push_str(&format!(" auto:{}", format_auto_refresh_remaining(secs)));
+    }
+    title.push_str(&format!(" sort:{} ", app.sort_mode.as_str()));
+
+    let mut table_state = TableState::default().with_selected(render_selected);
+
+    let aliases: Vec<&str> = app
+        .view_indices
+        .iter()
+        .map(|&idx| app.accounts[idx].alias.as_str())
+        .collect();
+    let emails: Vec<&str> = app
+        .view_indices
+        .iter()
+        .map(|&idx| app.accounts[idx].info.email.as_deref().unwrap_or("--"))
+        .collect();
+    let plan_labels: Vec<String> = app
+        .view_indices
+        .iter()
+        .map(|&idx| {
+            let entry = &app.accounts[idx];
+            let api_plan = match &entry.usage {
+                UsageStatus::Loaded(u) => u.plan_type.as_deref(),
+                _ => None,
+            };
+            entry
+                .info
+                .plan_label_with(api_plan.or(entry.info.plan_type.as_deref()))
+        })
+        .collect();
+    let plans: Vec<&str> = plan_labels.iter().map(String::as_str).collect();
+    let text_widths = table_text_widths(
+        area.width,
+        &aliases,
+        &emails,
+        &plans,
+        show_5h,
+    );
+
+    let mut constraints = vec![
+        Constraint::Length(2),                 // marker
+        Constraint::Length(text_widths.alias), // alias
+        Constraint::Length(text_widths.email), // email
+        Constraint::Length(text_widths.plan),  // plan
+        Constraint::Length(8),                 // status
+    ];
+    if show_5h {
+        constraints.push(Constraint::Length(6)); // 5h %
+    }
+    constraints.push(Constraint::Length(6)); // 7d %
+    if show_5h {
+        constraints.push(Constraint::Length(12)); // 5h reset
+    }
+    constraints.push(Constraint::Length(12)); // 7d reset
+    constraints.push(Constraint::Length(11)); // plan until
+
+
+    let natural: u16 = constraints
+        .iter()
+        .map(|c| match c {
+            Constraint::Length(n) => *n,
+            _ => 0,
+        })
+        .sum::<u16>()
+        .saturating_add(constraints.len().saturating_sub(1) as u16)
+        .saturating_add(2);
+    if natural > area.width {
+        // Too narrow for the table: one block per account, stacked, like `list`.
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_style(base().fg(C_BLUE))
+            .style(base());
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let per_card = cards.first().map_or(6, Vec::len);
+        let visible = usize::from(inner.height) / per_card.max(1);
+        let first = if visible > 0 && render_selected >= visible {
+            render_selected + 1 - visible
+        } else {
+            0
+        };
+        let lines: Vec<Line<'static>> = cards.into_iter().skip(first).flatten().collect();
+        f.render_widget(Paragraph::new(lines).style(base()), inner);
+        app.hitmap.account_list = None;
+        return;
+    }
+
+    let table = Table::new(rows, constraints)
+        .header(header)
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(base().fg(C_BLUE))
+                .style(base()),
+        )
+        .row_highlight_style(highlight())
+        .style(base());
+
+    f.render_stateful_widget(table, area, &mut table_state);
+    app.hitmap.account_list = Some(super::hitmap::ListHit {
+        rows_area: super::hitmap::table_rows_area(area),
+        offset: table_state.offset(),
+        row_count: app.view_indices.len(),
+    });
+}
+
+fn usage_gauges_height(usage: &UsageInfo) -> u16 {
+    let multi_pool = !usage.additional_limits.is_empty();
+    let mut height = 0u16;
+    let mut pool_count = 0u16;
+    let mut add_pool = |primary: bool, secondary: bool| {
+        if pool_count > 0 {
+            height = height.saturating_add(1);
+        }
+        if multi_pool {
+            height = height.saturating_add(1);
+        }
+        height = height.saturating_add(u16::from(primary) * 2);
+        height = height.saturating_add(u16::from(secondary) * 2);
+        if !primary && !secondary {
+            height = height.saturating_add(1);
+        }
+        pool_count = pool_count.saturating_add(1);
+    };
+    add_pool(usage.primary.is_some(), usage.secondary.is_some());
+    for pool in &usage.additional_limits {
+        add_pool(pool.primary.is_some(), pool.secondary.is_some());
+    }
+    height.max(1)
+}
+
+fn detail_panel_height(app: &App) -> u16 {
+    let gauges = app
+        .selected_account_idx()
+        .and_then(|idx| app.accounts.get(idx))
+        .and_then(|entry| match &entry.usage {
+            UsageStatus::Loaded(usage) => Some(usage_gauges_height(usage)),
+            _ => None,
+        })
+        .unwrap_or(4);
+    gauges.saturating_add(4)
+}
+
+fn render_detail_panel(f: &mut Frame, app: &App, area: Rect) {
+    let entry = match app
+        .selected_account_idx()
+        .and_then(|idx| app.accounts.get(idx))
+    {
+        Some(e) => e,
+        None => return,
+    };
+
+    let title = if entry.is_current {
+        format!(" * {} (active) ", entry.alias)
+    } else {
+        format!(" {} ", entry.alias)
+    };
+
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(base().fg(if entry.is_current { C_GREEN } else { C_BLUE }))
+        .style(base());
+
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1)])
+        .margin(1)
+        .split(inner);
+
+    // Usage area
+    match &entry.usage {
+        UsageStatus::Idle => {
+            let p = Paragraph::new("Press r to refresh usage").style(base().fg(DIM));
+            f.render_widget(p, layout[0]);
+        }
+        UsageStatus::Loading => {
+            let p = Paragraph::new("Fetching usage...").style(base().fg(C_YELLOW));
+            f.render_widget(p, layout[0]);
+        }
+        UsageStatus::Error(e) => {
+            let p = Paragraph::new(format!("Error: {}", e.detail)).style(base().fg(C_RED));
+            f.render_widget(p, layout[0]);
+        }
+        UsageStatus::Loaded(u) => {
+            render_usage_gauges(f, u, layout[0]);
+        }
+    }
+}
+
+pub(super) fn render_usage_gauges(f: &mut Frame, u: &UsageInfo, area: Rect) {
+    let now = crate::auth::now_unix_secs();
+    let multi_pool = !u.additional_limits.is_empty();
+    let mut y = area.y;
+    let mut render_pool = |f: &mut Frame,
+                           name: &str,
+                           primary: Option<&crate::usage::WindowUsage>,
+                           secondary: Option<&crate::usage::WindowUsage>,
+                           unavailable: bool| {
+        if y > area.y {
+            y = y.saturating_add(1);
+        }
+        if multi_pool && y < area.bottom() {
+            let title = if unavailable {
+                format!("{name}  unavailable")
+            } else {
+                name.to_string()
+            };
+            f.render_widget(
+                Paragraph::new(title).style(base().fg(if unavailable { C_RED } else { C_CYAN })),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            y = y.saturating_add(1);
+        }
+        if let Some(window) = primary
+            && y < area.bottom()
+        {
+            let (label, window_secs) =
+                quota_window_display(window, "5h", crate::usage::WINDOW_5H_SECS);
+            render_usage_gauge(
+                f,
+                window,
+                &label,
+                window_secs,
+                now,
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 2,
+                },
+            );
+            y = y.saturating_add(2);
+        }
+        if let Some(window) = secondary
+            && y < area.bottom()
+        {
+            let (label, window_secs) =
+                quota_window_display(window, "7d", crate::usage::WINDOW_7D_SECS);
+            render_usage_gauge(
+                f,
+                window,
+                &label,
+                window_secs,
+                now,
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 2,
+                },
+            );
+            y = y.saturating_add(2);
+        }
+        if primary.is_none() && secondary.is_none() && y < area.bottom() {
+            f.render_widget(
+                Paragraph::new("No active window").style(base().fg(DIM)),
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+            y = y.saturating_add(1);
+        }
+    };
+
+    render_pool(f, "Main", u.primary.as_ref(), u.secondary.as_ref(), false);
+    for pool in &u.additional_limits {
+        render_pool(
+            f,
+            pool.limit_name.as_deref().unwrap_or("Additional"),
+            pool.primary.as_ref(),
+            pool.secondary.as_ref(),
+            pool.allowed == Some(false) || pool.limit_reached == Some(true),
+        );
+    }
+}
+
+fn quota_window_display(
+    window: &crate::usage::WindowUsage,
+    fallback_label: &str,
+    fallback_secs: i64,
+) -> (String, i64) {
+    match window.window_minutes {
+        Some(minutes) if minutes % 1_440 == 0 => {
+            (format!("{}d", minutes / 1_440), minutes.saturating_mul(60))
+        }
+        Some(minutes) if minutes % 60 == 0 => {
+            (format!("{}h", minutes / 60), minutes.saturating_mul(60))
+        }
+        Some(minutes) => (format!("{minutes}m"), minutes.saturating_mul(60)),
+        None => (fallback_label.to_string(), fallback_secs),
+    }
+}
+
+
+
+
+
+
+
+
+
+/// Top tab bar: Accounts, Providers, Settings, Logs.
+fn render_tab_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let active = base().fg(BG).bg(C_CYAN).add_modifier(Modifier::BOLD);
+    let inactive = base().fg(C_GRAY);
+    let style = |tab: Tab| {
+        if app.active_tab == tab {
+            active
+        } else {
+            inactive
+        }
+    };
+
+    let accounts = format!(" Accounts ({}) ", app.accounts.len());
+    let settings = " Settings ".to_string();
+    let logs = " Logs ".to_string();
+    let gap_w = 2u16;
+
+    let mut x = area.x;
+    let tab_specs = [
+        (accounts.as_str(), Tab::Accounts),
+        (settings.as_str(), Tab::Settings),
+        (logs.as_str(), Tab::Logs),
+    ];
+    for (i, (label, tab)) in tab_specs.iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(gap_w);
+        }
+        let width = label.chars().count() as u16;
+        app.hitmap.tabs.push((
+            Rect {
+                x,
+                y: area.y,
+                width,
+                height: area.height.max(1),
+            },
+            *tab,
+        ));
+        x = x.saturating_add(width);
+    }
+
+    let line = Line::from(vec![
+        Span::styled(accounts, style(Tab::Accounts)),
+        Span::styled("  ", base()),
+        Span::styled("  ", base()),
+        Span::styled(settings, style(Tab::Settings)),
+        Span::styled("  ", base()),
+        Span::styled(logs, style(Tab::Logs)),
+        Span::styled("   Tab to switch", base().fg(DIM)),
+    ]);
+    f.render_widget(Paragraph::new(line).style(base()), area);
+}
+
+
+
+
+
+
+
+#[derive(Clone, Copy)]
+struct FooterActionSpec {
+    key: &'static str,
+    label: &'static str,
+    code: KeyCode,
+    enabled: bool,
+}
+
+type FooterHit = (usize, usize, usize, KeyCode);
+
+fn normal_footer_specs(app: &App) -> Vec<FooterActionSpec> {
+    match app.active_tab {
+        Tab::Logs => vec![
+            FooterActionSpec {
+                key: "tab",
+                label: "switch tabs",
+                code: KeyCode::Tab,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "↑",
+                label: "up",
+                code: KeyCode::Up,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "↓",
+                label: "down",
+                code: KeyCode::Down,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "end",
+                label: "latest",
+                code: KeyCode::End,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "q",
+                label: "quit",
+                code: KeyCode::Char('q'),
+                enabled: true,
+            },
+        ],
+
+        Tab::Settings => vec![
+            FooterActionSpec {
+                key: "↑",
+                label: "previous",
+                code: KeyCode::Up,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "↓",
+                label: "next",
+                code: KeyCode::Down,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "enter",
+                label: "edit",
+                code: KeyCode::Enter,
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "s",
+                label: "save",
+                code: KeyCode::Char('s'),
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "h",
+                label: "help",
+                code: KeyCode::Char('h'),
+                enabled: true,
+            },
+            FooterActionSpec {
+                key: "q",
+                label: "quit",
+                code: KeyCode::Char('q'),
+                enabled: true,
+            },
+        ],
+        Tab::Accounts => keymap::status_bar_items()
+            .into_iter()
+            .flat_map(|(key, label)| {
+                if key == "j / k / ↑ ↓" {
+                    return vec![
+                        FooterActionSpec {
+                            key: "↑",
+                            label: "previous",
+                            code: KeyCode::Up,
+                            enabled: app.view_indices.len() > 1,
+                        },
+                        FooterActionSpec {
+                            key: "↓",
+                            label: "next",
+                            code: KeyCode::Down,
+                            enabled: app.view_indices.len() > 1,
+                        },
+                    ];
+                }
+                vec![FooterActionSpec {
+                    key,
+                    label: short_label(label),
+                    code: account_footer_code(key),
+                    enabled: account_footer_enabled(app, key),
+                }]
+            })
+            .collect(),
+    }
+}
+
+fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    // Rename input takes top priority
+    if app.rename.is_some() {
+        let input = app.rename.as_ref().expect("rename").input.clone();
+        let shown = format!(" Rename: {input}#  (Enter confirm / Esc cancel)");
+        let line = Line::from(vec![
+            Span::styled(" Rename: ", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(input, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled("#", base().fg(C_GRAY)),
+            Span::styled("  (Enter confirm / Esc cancel)", base().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(base()), area);
+        app.hitmap.overlay_panel = Some(area);
+        if let Some(pos) = shown.find("Enter") {
+            register_overlay_key(app, area, pos, 5, KeyCode::Enter);
+        }
+        if let Some(pos) = shown.find("Esc") {
+            register_overlay_key(app, area, pos, 3, KeyCode::Esc);
+        }
+        return;
+    }
+
+    // Confirmation prompt
+    if app.confirm.is_some() {
+        let msg = match app.confirm.as_ref().expect("confirm") {
+            super::app::ConfirmAction::DiscardSettings => {
+                "Discard unsaved settings and quit? (y/n)".to_string()
+            }
+            super::app::ConfirmAction::Delete(alias) => {
+                format!("Delete profile '{alias}'? (y/n)")
+            }
+            super::app::ConfirmAction::BatchDelete(aliases) => {
+                format!("Delete {} marked profile(s)? (y/n)", aliases.len())
+            }
+
+        };
+        let line = Line::from(Span::styled(
+            msg.clone(),
+            base().fg(C_RED).add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(Paragraph::new(line).style(base()), area);
+        app.hitmap.overlay_panel = Some(area);
+        if let Some(pos) = msg.find("(y/n)") {
+            register_overlay_key(app, area, pos + 1, 1, KeyCode::Char('y'));
+            register_overlay_key(app, area, pos + 3, 1, KeyCode::Char('n'));
+        } else if let Some(pos) = msg.find("y to use") {
+            register_overlay_key(app, area, pos, 1, KeyCode::Char('y'));
+            if pos > 0 {
+                register_overlay_key(app, area, 0, pos, KeyCode::Esc);
+            }
+            let after = pos + 1;
+            if after < msg.chars().count() {
+                register_overlay_key(
+                    app,
+                    area,
+                    after,
+                    msg.chars().count().saturating_sub(after),
+                    KeyCode::Esc,
+                );
+            }
+        }
+        return;
+    }
+
+    if app.search_active {
+        let Some(query) = app.search.as_ref().map(|s| s.query.clone()) else {
+            return;
+        };
+        let shown = format!(" /{query}#  (Enter accept / Esc clear)");
+        let line = Line::from(vec![
+            Span::styled(" /", base().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+            Span::styled(query, base().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled("#", base().fg(C_GRAY)),
+            Span::styled("  (Enter accept / Esc clear)", base().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(base()), area);
+        app.hitmap.overlay_panel = Some(area);
+        if let Some(pos) = shown.find("Enter") {
+            register_overlay_key(app, area, pos, 5, KeyCode::Enter);
+        }
+        if let Some(pos) = shown.find("Esc") {
+            register_overlay_key(app, area, pos, 3, KeyCode::Esc);
+        }
+        return;
+    }
+
+    let load_warning = app
+        .profile_load_error
+        .as_deref()
+        .map(|error| format!("Account data stale/incomplete: {error}"))
+        .unwrap_or_default();
+    if !load_warning.is_empty() {
+        let warning_color = C_RED;
+        let msg = Line::from(Span::styled(
+            load_warning,
+            base().fg(warning_color).add_modifier(Modifier::BOLD),
+        ));
+        f.render_widget(Paragraph::new(msg).style(base()), area);
+    } else if let Some(s) = &app.status_msg {
+        let msg = Line::from(Span::styled(
+            s.as_str(),
+            base().fg(status_message_color(app.status_is_error)),
+        ));
+        f.render_widget(Paragraph::new(msg).style(base()), area);
+    } else if !app.marked.is_empty() {
+        let prefix = format!(" {} selected \u{2014} ", app.marked.len());
+        let enter_label = "for batch";
+        let esc_label = "to clear";
+        let enter_x = prefix.chars().count();
+        let esc_x = enter_x + "enter".chars().count() + 1 + enter_label.chars().count() + 3;
+        let line = Line::from(vec![
+            Span::styled(prefix, base().fg(C_YELLOW)),
+            Span::styled("enter", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {enter_label} \u{2502} "), base().fg(DIM)),
+            Span::styled("esc", base().fg(C_YELLOW).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {esc_label}"), base().fg(DIM)),
+        ]);
+        f.render_widget(Paragraph::new(line).style(base()), area);
+        register_footer_hit(app, area, 0, enter_x, "enter".len(), KeyCode::Enter);
+        register_footer_hit(app, area, 0, esc_x, "esc".len(), KeyCode::Esc);
+    } else {
+        let specs = normal_footer_specs(app);
+        render_footer_specs(f, app, area, &specs);
+    }
+
+    // Version indicator — always rendered at bottom-right corner
+    let ver_spans = version_spans(app);
+    if let Some(ver_area) = version_area(app, area) {
+        f.render_widget(
+            Paragraph::new(Line::from(ver_spans)).style(base()),
+            ver_area,
+        );
+    }
+}
+
+fn render_footer_specs(f: &mut Frame, app: &mut App, area: Rect, specs: &[FooterActionSpec]) {
+    let (lines, hits) = build_footer_layout(footer_content_width(app, area.width), specs);
+    f.render_widget(Paragraph::new(lines).style(base()), area);
+    for (line, x, width, code) in hits {
+        register_footer_hit(app, area, line, x, width, code);
+    }
+}
+
+fn footer_content_width(app: &App, width: u16) -> usize {
+    let version_width: usize = version_spans(app).iter().map(Span::width).sum();
+    usize::from(width).saturating_sub(version_width)
+}
+
+fn build_footer_layout(
+    width: usize,
+    specs: &[FooterActionSpec],
+) -> (Vec<Line<'static>>, Vec<FooterHit>) {
+    let separator = " \u{2502} ";
+    let mut lines = Vec::new();
+    let mut hits = Vec::new();
+    let mut spans = vec![Span::styled(" ", base())];
+    let mut used = 1usize;
+    let mut line = 0usize;
+
+    for (idx, spec) in specs.iter().enumerate() {
+        let key_width = spec.key.chars().count();
+        let label_width = spec.label.chars().count();
+        let separator_width = usize::from(idx + 1 < specs.len()) * separator.chars().count();
+        let item_width = key_width + 1 + label_width + separator_width;
+        if used + item_width > width && used > 1 {
+            lines.push(Line::from(spans));
+            spans = vec![Span::styled(" ", base())];
+            used = 1;
+            line += 1;
+        }
+
+        if spec.enabled {
+            hits.push((line, used, key_width + 1 + label_width, spec.code));
+        }
+        spans.push(Span::styled(
+            spec.key,
+            base().fg(C_YELLOW).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(" ", base()));
+        spans.push(Span::styled(spec.label, base().fg(C_GRAY)));
+        if idx + 1 < specs.len() {
+            spans.push(Span::styled(separator, base().fg(DIM)));
+        }
+        used += item_width;
+    }
+    if spans.len() > 1 || lines.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    (lines, hits)
+}
+
+fn register_overlay_key(app: &mut App, area: Rect, x: usize, width: usize, code: KeyCode) {
+    let Ok(x) = u16::try_from(x) else {
+        return;
+    };
+    let Ok(width) = u16::try_from(width) else {
+        return;
+    };
+    if width == 0 || x >= area.width {
+        return;
+    }
+    app.hitmap.overlay_clicks.push((
+        Rect {
+            x: area.x.saturating_add(x),
+            y: area.y,
+            width: width.min(area.width.saturating_sub(x)),
+            height: 1,
+        },
+        OverlayClick::Key(code),
+    ));
+}
+
+fn register_footer_hit(
+    app: &mut App,
+    area: Rect,
+    line: usize,
+    x: usize,
+    width: usize,
+    code: KeyCode,
+) {
+    let Ok(line) = u16::try_from(line) else {
+        return;
+    };
+    let Ok(x) = u16::try_from(x) else {
+        return;
+    };
+    let Ok(width) = u16::try_from(width) else {
+        return;
+    };
+    let y = area.y.saturating_add(line);
+    if y >= area.y.saturating_add(area.height) || x >= area.width {
+        return;
+    }
+    let mut right = x.saturating_add(width).min(area.width);
+    if let Some(version) = version_area(app, area)
+        && y == version.y
+        && version.x > area.x
+    {
+        right = right.min(version.x.saturating_sub(area.x));
+    }
+    if right > x {
+        app.hitmap.footer_actions.push((
+            Rect {
+                x: area.x.saturating_add(x),
+                y,
+                width: right - x,
+                height: 1,
+            },
+            code,
+        ));
+    }
+}
+
+fn account_footer_code(key: &str) -> KeyCode {
+    match key {
+        "j / k / ↑ ↓" => KeyCode::Char('j'),
+        "/" => KeyCode::Char('/'),
+        "enter" => KeyCode::Enter,
+        "o" => KeyCode::Char('o'),
+        "u" => KeyCode::Char('u'),
+        "a" => KeyCode::Char('a'),
+        "r" => KeyCode::Char('r'),
+        "i" => KeyCode::Char('i'),
+        "h" => KeyCode::Char('h'),
+        "q" => KeyCode::Char('q'),
+        _ => KeyCode::Null,
+    }
+}
+
+fn account_footer_enabled(app: &App, key: &str) -> bool {
+    let has_selected = app.selected_account_idx().is_some() && app.marked.is_empty();
+    match key {
+        "j / k / ↑ ↓" => app.view_indices.len() > 1,
+        "/" | "a" | "h" | "q" => true,
+        "enter" | "o" | "u" | "i" => has_selected,
+        "r" => !app.view_indices.is_empty(),
+        _ => false,
+    }
+}
+
+fn version_spans(app: &App) -> Vec<Span<'static>> {
+    let version = crate::update::current_version();
+    if let Some(latest) = &app.update_available {
+        vec![
+            Span::styled(" \u{2502} ", base().fg(DIM)),
+            Span::styled(format!("v{version}"), base().fg(DIM)),
+            Span::styled(format!(" -> v{latest} "), base().fg(C_YELLOW)),
+        ]
+    } else {
+        vec![
+            Span::styled(" \u{2502} ", base().fg(DIM)),
+            Span::styled(format!("v{version} "), base().fg(DIM)),
+        ]
+    }
+}
+
+fn version_area(app: &App, area: Rect) -> Option<Rect> {
+    let width: u16 = version_spans(app)
+        .iter()
+        .map(|span| span.width())
+        .try_fold(0u16, |acc, width| {
+            u16::try_from(width)
+                .ok()
+                .and_then(|width| acc.checked_add(width))
+        })?;
+    if area.width <= width {
+        return None;
+    }
+    Some(Rect {
+        x: area.x + area.width - width,
+        y: area.y + area.height.saturating_sub(1),
+        width,
+        height: 1,
+    })
+}
+
+/// Render a single usage gauge (5h or 7d) with block chars and pace marker.
+fn render_usage_gauge(
+    f: &mut Frame,
+    w: &crate::usage::WindowUsage,
+    label: &str,
+    window_secs: i64,
+    now: i64,
+    area: Rect,
+) {
+    let used = w.used_percent.unwrap_or(0.0).min(100.0);
+    let remaining_pct = (100.0 - used).max(0.0);
+    let pace = crate::usage::visible_pace_percent(w, window_secs);
+    let over = used >= 10.0 && pace.is_some_and(|p| used > p);
+    let reset_str = w
+        .resets_at
+        .map(format_reset_time)
+        .unwrap_or_else(|| "--".into());
+    let remaining_secs = w.resets_at.map(|ts| ts - now).unwrap_or(0);
+
+    // Row 1: block-char bar  "5h  ████████░░|░░░░░░░  25% used  75% left"
+    let gauge_area = Rect { height: 1, ..area };
+    let label_text = format!("{label}  ");
+    let suffix = format!("  {used:.0}% used  {remaining_pct:.0}% left");
+    let bar_width = (gauge_area.width as usize)
+        .saturating_sub(label_text.len())
+        .saturating_sub(suffix.len());
+
+    let used_color = if used >= 90.0 {
+        C_RED
+    } else if over || used >= 70.0 {
+        C_YELLOW
+    } else {
+        C_GREEN
+    };
+    let used_style = base().fg(used_color);
+    let remaining_style = base().fg(remaining_color(remaining_pct));
+    let pace_style = base().fg(C_WHITE).add_modifier(Modifier::BOLD);
+
+    // L2: if bar_width is 0 (extremely narrow terminal), skip bar rendering entirely
+    if bar_width == 0 {
+        let reset_area = Rect {
+            y: area.y + 1,
+            height: 1,
+            ..area
+        };
+        let reset_text = format!("resets in {reset_str}");
+        f.render_widget(
+            Paragraph::new(reset_text).style(base().fg(reset_color(remaining_secs))),
+            reset_area,
+        );
+        return;
+    }
+
+    let pace_pos = pace.map(|p| {
+        ((p / 100.0) * bar_width as f64)
+            .round()
+            .clamp(0.0, bar_width.saturating_sub(1) as f64) as usize
+    });
+    let used_pos = ((used / 100.0) * bar_width as f64)
+        .round()
+        .clamp(0.0, bar_width as f64) as usize;
+
+    let mut spans = vec![Span::styled(label_text.clone(), base().fg(C_WHITE))];
+
+    if let Some(pp) = pace_pos {
+        let before_used = pp.min(used_pos);
+        let before_remaining = pp.saturating_sub(used_pos);
+        let after_used = used_pos.saturating_sub(pp + 1);
+        let after_remaining = bar_width.saturating_sub(pp + 1 + after_used);
+
+        if before_used > 0 {
+            spans.push(Span::styled("█".repeat(before_used), used_style));
+        }
+        if before_remaining > 0 {
+            spans.push(Span::styled("░".repeat(before_remaining), remaining_style));
+        }
+        spans.push(Span::styled("|", pace_style));
+        if after_used > 0 {
+            spans.push(Span::styled("█".repeat(after_used), used_style));
+        }
+        if after_remaining > 0 {
+            spans.push(Span::styled("░".repeat(after_remaining), remaining_style));
+        }
+    } else {
+        if used_pos > 0 {
+            spans.push(Span::styled("█".repeat(used_pos), used_style));
+        }
+        if bar_width > used_pos {
+            spans.push(Span::styled(
+                "░".repeat(bar_width - used_pos),
+                remaining_style,
+            ));
+        }
+    }
+
+    let suffix_color = if over { C_YELLOW } else { DIM };
+    spans.push(Span::styled(suffix, base().fg(suffix_color)));
+
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base()), gauge_area);
+
+    // Row 2: "started HH:MM" left, "↑ pace" at pace position, "resets in ..." right
+    let reset_area = Rect {
+        y: area.y + 1,
+        height: 1,
+        ..area
+    };
+    let reset_text = format!("resets in {reset_str}");
+    let reset_style = base().fg(reset_color(remaining_secs));
+    let started_text = w
+        .resets_at
+        .map(|ts| format!("started {}", format_local_time(ts - window_secs)))
+        .unwrap_or_default();
+    let started_len = started_text.len();
+
+    let total_width = reset_area.width as usize;
+    let reset_start = total_width.saturating_sub(reset_text.len());
+
+    let row2 = if let Some(pp) = pace_pos {
+        let arrow_offset = label_text.len() + pp;
+        let pace_label = "\u{2191} pace"; // ↑ pace  (display width = 6, byte len = 8)
+        const PACE_LABEL_DISPLAY_WIDTH: usize = 6;
+        let pace_end = arrow_offset + PACE_LABEL_DISPLAY_WIDTH;
+
+        // Try to fit: started ... ↑ pace ... resets in ...
+        if !started_text.is_empty()
+            && started_len + 2 <= arrow_offset
+            && pace_end + 2 <= reset_start
+        {
+            Line::from(vec![
+                Span::styled(&started_text, base().fg(DIM)),
+                Span::styled(" ".repeat(arrow_offset - started_len), base()),
+                Span::styled(pace_label, base().fg(DIM)),
+                Span::styled(" ".repeat(reset_start - pace_end), base()),
+                Span::styled(reset_text, reset_style),
+            ])
+        } else if pace_end + 2 <= reset_start {
+            // No room for started, show pace + reset
+            Line::from(vec![
+                Span::styled(" ".repeat(arrow_offset), base()),
+                Span::styled(pace_label, base().fg(DIM)),
+                Span::styled(" ".repeat(reset_start - pace_end), base()),
+                Span::styled(reset_text, reset_style),
+            ])
+        } else {
+            // Tight: started left, reset right
+            let mut spans = Vec::new();
+            if !started_text.is_empty() && started_len + 2 <= reset_start {
+                spans.push(Span::styled(&started_text, base().fg(DIM)));
+                spans.push(Span::styled(" ".repeat(reset_start - started_len), base()));
+            } else {
+                spans.push(Span::styled(" ".repeat(reset_start), base()));
+            }
+            spans.push(Span::styled(reset_text, reset_style));
+            Line::from(spans)
+        }
+    } else {
+        // No pace marker: started left, reset after label offset
+        let mut spans = Vec::new();
+        if !started_text.is_empty() {
+            spans.push(Span::styled(&started_text, base().fg(DIM)));
+            let gap = reset_start.saturating_sub(started_len);
+            spans.push(Span::styled(" ".repeat(gap), base()));
+        } else {
+            spans.push(Span::styled(" ".repeat(label_text.len()), base()));
+        }
+        spans.push(Span::styled(reset_text, reset_style));
+        Line::from(spans)
+    };
+
+    f.render_widget(Paragraph::new(row2).style(base()), reset_area);
+}
+
+// ── Style helpers ─────────────────────────────────────────
+
+/// Color for remaining percentage: green > 30%, yellow > 10%, red <= 10%
+fn remaining_color(remaining_pct: f64) -> Color {
+    if remaining_pct > 30.0 {
+        C_GREEN
+    } else if remaining_pct > 10.0 {
+        C_YELLOW
+    } else {
+        C_RED
+    }
+}
+
+fn plan_color(plan: Option<&str>, is_selected: bool) -> Style {
+    let kind = PlanKind::from_wire(plan);
+    let fg = match kind {
+        PlanKind::Free | PlanKind::Unknown => C_GRAY,
+        PlanKind::Go => C_BLUE,
+        PlanKind::Plus => C_CYAN,
+        PlanKind::ProLite | PlanKind::Pro => C_YELLOW,
+        PlanKind::Team | PlanKind::Business | PlanKind::Enterprise | PlanKind::Edu => C_MAGENTA,
+    };
+    let s = base().fg(fg);
+    if is_selected || matches!(kind, PlanKind::Pro | PlanKind::Enterprise) {
+        s.add_modifier(Modifier::BOLD)
+    } else {
+        s
+    }
+}
+
+/// Color for reset countdown: green = soon (< 1h), yellow = medium (< 4h), red = far (>= 4h)
+fn reset_color(remaining_secs: i64) -> Color {
+    if remaining_secs < 3600 {
+        C_GREEN
+    } else if remaining_secs < 14400 {
+        C_YELLOW
+    } else {
+        C_RED
+    }
+}
+
+fn usage_pct_style(remaining_pct_str: &str, is_selected: bool) -> Style {
+    let over_pace = remaining_pct_str.ends_with('!');
+    let clean = remaining_pct_str.trim_end_matches('!');
+    let fg = if over_pace {
+        C_RED
+    } else {
+        match clean.trim_end_matches('%').parse::<f64>() {
+            Ok(n) => remaining_color(n),
+            Err(_) => DIM,
+        }
+    };
+    let s = base().fg(fg);
+    if is_selected {
+        s.add_modifier(Modifier::BOLD)
+    } else {
+        s
+    }
+}
+
+/// Compress verbose keymap labels for status bar.
+fn short_label(label: &str) -> &str {
+    match label {
+        "move selection" => "nav",
+        "search" => "search",
+        "open selected account actions" => "menu",
+        "add new account" => "add",
+        "refresh visible accounts" => "refresh",
+        "show / hide account detail panel" => "detail",
+        "use (switch to)" => "use",
+        "show this help (main view)" => "help",
+        "quit (main view)" => "quit",
+        "launch Codex" => "launch",
+        other => other,
+    }
+}
+
+fn format_auto_refresh_remaining(secs: u64) -> String {
+    if secs == 0 {
+        return "now".to_string();
+    }
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    let rem = secs % 60;
+    if rem == 0 {
+        format!("{mins}m")
+    } else {
+        format!("{mins}m{rem}s")
+    }
+}
+
+fn status_bar_height(app: &App, width: u16) -> usize {
+    if app.status_msg.is_some()
+        || app.profile_load_error.is_some()
+        || app.rename.is_some()
+        || app.confirm.is_some()
+        || app.search_active
+        || !app.marked.is_empty()
+    {
+        return 1;
+    }
+    build_footer_layout(footer_content_width(app, width), &normal_footer_specs(app))
+        .0
+        .len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jwt::AccountInfo;
+    use crate::tui::app::{AccountEntry, App, Tab, UsageStatus};
+    use crate::usage::{AdditionalRateLimit, ResetCredit, UsageInfo, WindowUsage};
+    use ratatui::style::Modifier;
+    use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+    use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    fn row_text(backend: &TestBackend, y: u16) -> String {
+        let area = backend.buffer().area;
+        (0..area.width)
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, y))
+                    .expect("cell inside test buffer")
+                    .symbol()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn status_message_color_distinguishes_errors_from_information() {
+        assert_eq!(status_message_color(false), C_CYAN);
+        assert_eq!(status_message_color(true), C_RED);
+    }
+
+    #[test]
+    fn persistent_load_warning_overrides_transient_status_until_reload_succeeds() {
+        let mut app = App::new();
+        app.profile_load_error = Some("could not read profile directory".into());
+        app.status_msg = Some("A later informational message".into());
+        app.status_is_error = false;
+        assert_eq!(status_bar_height(&app, 100), 1);
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        terminal
+            .draw(|frame| render_status_bar(frame, &mut app, frame.area()))
+            .unwrap();
+        let rendered = row_text(terminal.backend(), 0);
+        assert!(
+            rendered.contains("Account data stale/incomplete"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("A later informational message"),
+            "{rendered}"
+        );
+
+        app.profile_load_error = None;
+        terminal
+            .draw(|frame| render_status_bar(frame, &mut app, frame.area()))
+            .unwrap();
+        assert!(row_text(terminal.backend(), 0).contains("A later informational message"));
+    }
+
+
+
+
+
+
+
+    #[test]
+    fn version_area_is_absent_when_the_terminal_is_narrower_than_the_version() {
+        assert!(version_area(&App::new(), Rect::new(0, 0, 0, 0)).is_none());
+    }
+
+
+
+
+
+
+
+
+
+    #[test]
+    fn logs_render_in_their_own_tab() {
+        let mut app = App::new();
+        app.log_writer = crate::logging::TuiLogWriter::new();
+        app.active_tab = Tab::Logs;
+        app.log_writer
+            .make_writer()
+            .write_all(b"tui-tab-test-error\n")
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .unwrap();
+
+        let screen = (0..12)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Accounts"));
+        assert!(screen.contains("Logs"));
+        assert!(screen.contains("tui-tab-test-error"));
+    }
+
+    #[test]
+    fn logs_tab_starts_at_the_wrapped_tail_of_long_errors() {
+        let mut app = App::new();
+        app.log_writer = crate::logging::TuiLogWriter::new();
+        app.active_tab = Tab::Logs;
+        let error = format!("{}LATEST_TAIL\n", "x".repeat(200));
+        app.log_writer
+            .make_writer()
+            .write_all(error.as_bytes())
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .unwrap();
+
+        let screen = (0..8)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("LATEST_TAIL"));
+    }
+
+    #[test]
+    fn logs_tab_clamps_scroll_before_rendering_a_short_log() {
+        let mut app = App::new();
+        app.log_writer = crate::logging::TuiLogWriter::new();
+        app.active_tab = Tab::Logs;
+        app.log_scroll = 10;
+        app.log_writer
+            .make_writer()
+            .write_all(b"short-log-marker\n")
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+
+        terminal
+            .draw(|frame| super::render(frame, &mut app))
+            .unwrap();
+
+        let screen = (0..8)
+            .map(|y| row_text(terminal.backend(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("short-log-marker"));
+        assert_eq!(app.log_scroll, 0);
+    }
+
+
+
+    fn reset_credit_expiring_in(seconds: i64) -> ResetCredit {
+        ResetCredit {
+            id: format!("credit-{seconds}"),
+            granted_at: None,
+            expires_at: Some(
+                chrono::DateTime::from_timestamp(crate::auth::now_unix_secs() + seconds, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+            ),
+        }
+    }
+
+
+
+
+
+    #[test]
+    fn additional_quota_pool_expands_the_main_detail_panel() {
+        let window = WindowUsage {
+            used_percent: Some(25.0),
+            resets_at: Some(1_000_000),
+            window_minutes: Some(300),
+        };
+        let usage = UsageInfo {
+            primary: Some(window.clone()),
+            secondary: Some(window.clone()),
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-6-Codex-Burst".to_string()),
+                metered_feature: Some("codex_futureburst".to_string()),
+                primary: Some(window.clone()),
+                secondary: Some(window),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(usage_gauges_height(&usage), 11);
+    }
+
+    #[test]
+    fn additional_primary_slot_uses_its_real_seven_day_window_for_label_and_pace() {
+        let usage = UsageInfo {
+            additional_limits: vec![AdditionalRateLimit {
+                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
+                metered_feature: Some("codex_bengalfox".to_string()),
+                primary: Some(WindowUsage {
+                    used_percent: Some(8.0),
+                    resets_at: Some(crate::auth::now_unix_secs() + 6 * 24 * 60 * 60),
+                    window_minutes: Some(7 * 24 * 60),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let backend = TestBackend::new(100, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| render_usage_gauges(frame, &usage, frame.area()))
+            .unwrap();
+
+        let row = (0..10)
+            .map(|y| row_text(terminal.backend(), y))
+            .find(|line| line.contains("7d"))
+            .expect("the real seven-day window label must be rendered");
+        assert!(!row.contains("5h"));
+        let label_x = row.find("7d").unwrap();
+        let pace_x = row.find('|').expect("pace marker");
+        assert!(
+            pace_x > label_x + 6,
+            "seven-day pace must not be clamped to the start of the bar: {row}"
+        );
+    }
+
+    #[test]
+    fn plan_color_uses_semantic_plan_families() {
+        assert_eq!(plan_color(Some("go"), false).fg, Some(C_BLUE));
+        assert_eq!(plan_color(Some("plus"), false).fg, Some(C_CYAN));
+        assert_eq!(plan_color(Some("prolite"), false).fg, Some(C_YELLOW));
+        let pro = plan_color(Some("pro"), false);
+        assert_eq!(pro.fg, Some(C_YELLOW));
+        assert!(pro.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(plan_color(Some("team"), false).fg, Some(C_MAGENTA));
+        assert_eq!(plan_color(Some("business"), false).fg, Some(C_MAGENTA));
+        assert_eq!(plan_color(Some("future_plan"), false).fg, Some(C_GRAY));
+    }
+
+    #[test]
+    fn account_table_columns_expand_to_fit_names_when_space_is_available() {
+        let widths = table_text_widths(
+            180,
+            &["oai001_20x", "a-very-long-account-alias"],
+            &["oai001@ozi.xyz"],
+            &["Pro 20×", "Team - NightCity Workspace"],
+            true,
+        );
+
+        assert!(widths.alias >= "a-very-long-account-alias".chars().count() as u16);
+        assert!(widths.plan >= "Team - NightCity Workspace".chars().count() as u16);
+    }
+
+    #[test]
+    fn account_table_columns_fit_an_eighty_column_terminal() {
+        let widths = table_text_widths(
+            80,
+            &["a-very-long-account-alias"],
+            &["a-very-long-address@example.com"],
+            &["Team - NightCity Workspace"],
+            true,
+        );
+
+        assert!(widths.alias + widths.email + widths.plan <= 16);
+    }
+
+    #[test]
+    fn account_table_columns_use_extra_space_beyond_the_old_caps() {
+        let alias = "a".repeat(45);
+        let email = format!("{}@example.com", "e".repeat(40));
+        let plan = format!("Team - {}", "Workspace".repeat(5));
+        let widths = table_text_widths(260, &[&alias], &[&email], &[&plan], true);
+
+        assert_eq!(widths.alias, alias.len() as u16);
+        assert_eq!(widths.email, email.len() as u16);
+        assert_eq!(widths.plan, plan.len() as u16);
+    }
+
+
+
+    #[test]
+    fn narrow_window_stacks_one_block_per_account() {
+        let mut app = App::new();
+        for alias in ["paperengineer05", "paperengineer07"] {
+            app.accounts.push(AccountEntry {
+                alias: alias.into(),
+                info: AccountInfo {
+                    email: Some(format!("{alias}@gmail.com")),
+                    ..AccountInfo::default()
+                },
+                usage: UsageStatus::Loaded(Box::default()),
+                is_current: alias.ends_with('5'),
+            });
+            app.view_indices.push(app.view_indices.len());
+        }
+
+        let render = |app: &mut App, width: u16| {
+            let backend = TestBackend::new(width, 16);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_account_table(frame, app, frame.area()))
+                .unwrap();
+            (0..16)
+                .map(|y| row_text(terminal.backend(), y))
+                .collect::<Vec<_>>()
+                .join("
+")
+        };
+
+        let narrow = render(&mut app, 50);
+        assert!(narrow.contains("1. paperengineer05"), "{narrow}");
+        assert!(narrow.contains("paperengineer07@gmail.com"), "{narrow}");
+        assert!(narrow.contains("5h ") && narrow.contains("7d "), "{narrow}");
+        assert!(!narrow.contains("Alias"), "no table header when stacked: {narrow}");
+
+        let wide = render(&mut app, 160);
+        assert!(wide.contains("Alias") && wide.contains("Email"), "{wide}");
+    }
+
+
+}

@@ -1,0 +1,697 @@
+use anyhow::{Context, Result};
+use chrono::{Days, Local, NaiveDate};
+use fs4::FileExt;
+use std::{
+    cell::Cell,
+    collections::VecDeque,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+use tracing_subscriber::fmt::MakeWriter;
+
+const LOG_PREFIX: &str = "paper-claude-switch";
+const MAX_LOG_AGE_DAYS: u64 = 3;
+const MAX_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_TUI_LOG_LINES: usize = 1000;
+/// TUI diagnostics are intended for short operational history, not response dumps.
+const MAX_TUI_LOG_LINE_BYTES: usize = 8 * 1024;
+const MAX_TUI_LOG_BYTES: usize = 512 * 1024;
+const TUI_TRUNCATION_MARKER: &str = "… [truncated]";
+static TUI_LOG_WRITER: OnceLock<TuiLogWriter> = OnceLock::new();
+thread_local! {
+    static IN_FILE_LOG_WRITE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct FileLogWriteGuard;
+
+impl FileLogWriteGuard {
+    fn enter() -> Option<Self> {
+        IN_FILE_LOG_WRITE.with(|active| {
+            if active.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for FileLogWriteGuard {
+    fn drop(&mut self) {
+        IN_FILE_LOG_WRITE.with(|active| active.set(false));
+    }
+}
+
+pub(crate) fn tui_log_writer() -> TuiLogWriter {
+    TUI_LOG_WRITER.get_or_init(TuiLogWriter::new).clone()
+}
+
+#[derive(Clone)]
+pub(crate) struct TuiLogWriter {
+    state: Arc<Mutex<TuiLogState>>,
+}
+
+struct TuiLogState {
+    lines: VecDeque<String>,
+    capacity: usize,
+    max_line_bytes: usize,
+    max_bytes: usize,
+    bytes: usize,
+    revision: u64,
+}
+
+impl TuiLogWriter {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TuiLogState {
+                lines: VecDeque::new(),
+                capacity: MAX_TUI_LOG_LINES,
+                max_line_bytes: MAX_TUI_LOG_LINE_BYTES,
+                max_bytes: MAX_TUI_LOG_BYTES,
+                bytes: 0,
+                revision: 0,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_for_test(capacity: usize, max_line_bytes: usize, max_bytes: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(TuiLogState {
+                lines: VecDeque::new(),
+                capacity,
+                max_line_bytes,
+                max_bytes,
+                bytes: 0,
+                revision: 0,
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|state| state.lines.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn lines_if_changed(
+        &self,
+        previous_revision: Option<u64>,
+    ) -> Option<(u64, Vec<String>)> {
+        let state = self.state.lock().ok()?;
+        (previous_revision != Some(state.revision)).then(|| {
+            (
+                state.revision,
+                state.lines.iter().cloned().collect::<Vec<_>>(),
+            )
+        })
+    }
+}
+
+impl<'a> MakeWriter<'a> for TuiLogWriter {
+    type Writer = TuiLogSink;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TuiLogSink {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+pub(crate) struct TuiLogSink {
+    state: Arc<Mutex<TuiLogState>>,
+}
+
+impl Write for TuiLogSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("TUI log writer lock poisoned"))?;
+        let mut changed = false;
+        for line in String::from_utf8_lossy(buf).lines() {
+            let line = truncate_tui_line(line, state.max_line_bytes.min(state.max_bytes));
+            while state.lines.len() >= state.capacity
+                || state.bytes.saturating_add(line.len()) > state.max_bytes
+            {
+                let Some(removed) = state.lines.pop_front() else {
+                    break;
+                };
+                state.bytes = state.bytes.saturating_sub(removed.len());
+            }
+            if line.len() > state.max_bytes {
+                continue;
+            }
+            if state.lines.len() == state.capacity {
+                state.lines.pop_front();
+            }
+            state.bytes = state.bytes.saturating_add(line.len());
+            state.lines.push_back(line);
+            changed = true;
+        }
+        if changed {
+            state.revision = state.revision.wrapping_add(1);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn truncate_tui_line(line: &str, max_bytes: usize) -> String {
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    if TUI_TRUNCATION_MARKER.len() >= max_bytes {
+        return utf8_prefix(TUI_TRUNCATION_MARKER, max_bytes).to_string();
+    }
+
+    let content_bytes = max_bytes - TUI_TRUNCATION_MARKER.len();
+    format!(
+        "{}{}",
+        utf8_prefix(line, content_bytes),
+        TUI_TRUNCATION_MARKER
+    )
+}
+
+fn utf8_prefix(value: &str, max_bytes: usize) -> &str {
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next = index + character.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &value[..end]
+}
+
+/// How long retention may go unenforced, and how many bytes may be appended in
+/// the meantime.
+///
+/// `tracing` calls `Write::write` once per record and the retention scan walks
+/// the log directory, so running it per record made every debug-level log line
+/// a directory walk. Retention only has to be approximately timely: whichever
+/// of these two is reached first triggers the next scan, which bounds how far
+/// the directory can drift past [`MAX_LOG_BYTES`] to one byte budget.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+const MAINTENANCE_BYTE_BUDGET: u64 = 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct FileLogWriter {
+    state: Arc<Mutex<LogState>>,
+}
+
+struct LogState {
+    dir: PathBuf,
+    /// When retention was last enforced; `None` until the first record.
+    last_maintenance: Option<Instant>,
+    /// Bytes appended since that enforcement.
+    bytes_since_maintenance: u64,
+}
+
+pub(crate) fn file_log_writer() -> Result<FileLogWriter> {
+    let dir = crate::auth::app_home()?.join("logs");
+    create_private_log_dir(&dir)
+        .with_context(|| format!("creating log directory {}", dir.display()))?;
+    Ok(FileLogWriter {
+        state: Arc::new(Mutex::new(LogState {
+            dir,
+            last_maintenance: None,
+            bytes_since_maintenance: 0,
+        })),
+    })
+}
+
+fn create_private_log_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(dir)?;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(windows)]
+    {
+        fs::create_dir_all(dir)?;
+        crate::auth::harden_windows_private_directory(dir)
+            .map_err(|e| io::Error::other(e.to_string()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
+
+#[cfg(unix)]
+fn tighten_file_permissions(file: &fs::File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+}
+
+impl<'a> MakeWriter<'a> for FileLogWriter {
+    type Writer = LogFile;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogFile {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+pub(crate) struct LogFile {
+    state: Arc<Mutex<LogState>>,
+}
+
+impl Write for LogFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Permission and retention helpers can emit tracing events. A nested
+        // file write must be skipped before taking the state lock, or it would
+        // deadlock while the outer write is doing that maintenance.
+        let Some(_write_guard) = FileLogWriteGuard::enter() else {
+            return Ok(buf.len());
+        };
+        let retained = if buf.len() as u64 > MAX_LOG_BYTES {
+            &buf[buf.len() - MAX_LOG_BYTES as usize..]
+        } else {
+            buf
+        };
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("log writer lock poisoned"))?;
+        state.bytes_since_maintenance = state
+            .bytes_since_maintenance
+            .saturating_add(retained.len() as u64);
+        let now = Instant::now();
+        let run_maintenance =
+            maintenance_due(state.last_maintenance, now, state.bytes_since_maintenance);
+        append_log(
+            &state.dir,
+            Local::now().date_naive(),
+            retained,
+            run_maintenance,
+        )?;
+        if run_maintenance {
+            state.last_maintenance = Some(now);
+            state.bytes_since_maintenance = 0;
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether this record should also pay for a retention scan.
+///
+/// The first record of a process always does — nothing earlier can have done
+/// it — and after that whichever of the byte budget or the interval arrives
+/// first.
+fn maintenance_due(last: Option<Instant>, now: Instant, bytes_since: u64) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    bytes_since >= MAINTENANCE_BYTE_BUDGET || now.duration_since(last) >= MAINTENANCE_INTERVAL
+}
+
+fn append_log(dir: &Path, today: NaiveDate, bytes: &[u8], run_maintenance: bool) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut lock_options = OpenOptions::new();
+    lock_options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        lock_options.mode(0o600);
+    }
+    let lock_path = dir.join(".lock");
+    let lock = lock_options.open(&lock_path)?;
+    #[cfg(unix)]
+    tighten_file_permissions(&lock)?;
+    #[cfg(windows)]
+    crate::auth::harden_windows_private_file(&lock_path)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    FileExt::lock(&lock)?;
+    let result = (|| {
+        if run_maintenance {
+            run_log_maintenance(dir, today, bytes.len() as u64)?;
+        }
+        let mut log_options = OpenOptions::new();
+        log_options.create(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            log_options.mode(0o600);
+        }
+        let log_path = log_path(dir, today);
+        let mut file = log_options.open(&log_path)?;
+        #[cfg(unix)]
+        tighten_file_permissions(&file)?;
+        #[cfg(windows)]
+        crate::auth::harden_windows_private_file(&log_path)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        file.write_all(bytes)
+    })();
+    FileExt::unlock(&lock)?;
+    result
+}
+
+/// Drop log files outside the retention window.
+///
+/// Size enforcement used to be nested at the end of this, which meant a single
+/// append ran three directory scans: this one, the nested one, and the caller's.
+/// The two passes are now siblings under [`run_log_maintenance`], so an append
+/// that does maintenance costs two scans and one that does not costs none.
+fn prune_expired_log_files(dir: &Path, today: NaiveDate) -> io::Result<()> {
+    let oldest = today - Days::new(MAX_LOG_AGE_DAYS - 1);
+    for (path, date, _) in log_files(dir)? {
+        if date < oldest {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Age retention, then size retention accounting for the record about to be
+/// written.
+fn run_log_maintenance(dir: &Path, today: NaiveDate, incoming: u64) -> io::Result<()> {
+    prune_expired_log_files(dir, today)?;
+    enforce_log_size_limit(dir, today, incoming)
+}
+
+fn enforce_log_size_limit(dir: &Path, today: NaiveDate, incoming: u64) -> io::Result<()> {
+    let current = log_path(dir, today);
+    let mut files = log_files(dir)?;
+    files.sort_by_key(|(_, date, _)| *date);
+    let mut total = files.iter().map(|(_, _, size)| *size).sum::<u64>();
+
+    for (path, _, size) in &files {
+        if total.saturating_add(incoming) <= MAX_LOG_BYTES {
+            return Ok(());
+        }
+        if *path != current {
+            fs::remove_file(path)?;
+            total = total.saturating_sub(*size);
+        }
+    }
+
+    if total.saturating_add(incoming) > MAX_LOG_BYTES && current.exists() {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&current)?
+            .set_len(0)?;
+    }
+    Ok(())
+}
+
+fn log_files(dir: &Path) -> io::Result<Vec<(PathBuf, NaiveDate, u64)>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(date) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(log_date)
+        else {
+            continue;
+        };
+        if entry.file_type()?.is_file() {
+            files.push((path, date, entry.metadata()?.len()));
+        }
+    }
+    Ok(files)
+}
+
+fn log_path(dir: &Path, date: NaiveDate) -> PathBuf {
+    dir.join(format!("{LOG_PREFIX}.{date}.log"))
+}
+
+fn log_date(filename: &str) -> Option<NaiveDate> {
+    filename
+        .strip_prefix(&format!("{LOG_PREFIX}."))?
+        .strip_suffix(".log")
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtered_tui_and_file_layers_receive_events_after_file_write() {
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let file_writer = FileLogWriter {
+            state: Arc::new(Mutex::new(LogState {
+                dir: dir.path().to_path_buf(),
+                last_maintenance: None,
+                bytes_since_maintenance: 0,
+            })),
+        };
+        let tui_writer = TuiLogWriter::new();
+        let tui_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(tui_writer.clone())
+            .with_filter(tracing_subscriber::EnvFilter::new("claude_switch=debug"));
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(file_writer)
+            .with_filter(tracing_subscriber::EnvFilter::new("claude_switch=debug"));
+        let subscriber = tracing_subscriber::registry()
+            .with(tui_layer)
+            .with(file_layer);
+        let dispatch = tracing::Dispatch::new(subscriber);
+
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::info!(
+                target: "claude_switch::usage::api",
+                phase = "cache_get_initial",
+                elapsed_ms = 1,
+                outcome = "miss",
+                "usage local phase finished"
+            );
+            tracing::info!(
+                target: "claude_switch::usage::api",
+                phase = "refresh_post_started",
+                outcome = "started",
+                "credential refresh HTTP phase started"
+            );
+            tracing::info!(
+                target: "claude_switch::usage::api",
+                phase = "usage_total",
+                elapsed_ms = 5,
+                outcome = "success",
+                "usage fetch finished"
+            );
+        });
+
+        let tui_lines = tui_writer.lines_if_changed(None).unwrap().1;
+        let daily_log =
+            fs::read_to_string(log_path(dir.path(), Local::now().date_naive())).unwrap();
+        for phase in ["cache_get_initial", "refresh_post_started", "usage_total"] {
+            assert_eq!(
+                tui_lines.iter().filter(|line| line.contains(phase)).count(),
+                1,
+                "TUI layer did not receive phase {phase}: {tui_lines:?}"
+            );
+            assert_eq!(
+                daily_log
+                    .lines()
+                    .filter(|line| line.contains(phase))
+                    .count(),
+                1,
+                "file layer did not receive phase {phase}: {daily_log}"
+            );
+        }
+    }
+
+    #[test]
+    fn tui_writer_keeps_logs_in_memory_without_terminal_output() {
+        let writer = TuiLogWriter::new_for_test(3, MAX_TUI_LOG_LINE_BYTES, MAX_TUI_LOG_BYTES);
+        let mut sink = writer.make_writer();
+        sink.write_all(b"first\nsecond\n").unwrap();
+
+        let (revision, lines) = writer.lines_if_changed(None).unwrap();
+        assert_eq!(lines, vec!["first", "second"]);
+        assert!(writer.lines_if_changed(Some(revision)).is_none());
+
+        sink.write_all(b"third\n").unwrap();
+        assert_eq!(
+            writer.lines_if_changed(Some(revision)).unwrap().1,
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn tui_writer_discards_oldest_lines_at_capacity() {
+        let writer = TuiLogWriter::new_for_test(2, MAX_TUI_LOG_LINE_BYTES, MAX_TUI_LOG_BYTES);
+        let mut sink = writer.make_writer();
+        sink.write_all(b"first\nsecond\nthird\n").unwrap();
+
+        assert_eq!(writer.lines(), vec!["second", "third"]);
+    }
+
+    #[test]
+    fn tui_writer_truncates_long_utf8_lines_and_bounds_total_bytes() {
+        let writer = TuiLogWriter::new_for_test(10, MAX_TUI_LOG_LINE_BYTES, MAX_TUI_LOG_BYTES);
+        let mut sink = writer.make_writer();
+        let oversized = "界".repeat(4_000);
+        sink.write_all(format!("{oversized}\nsmall\n").as_bytes())
+            .unwrap();
+
+        let lines = writer.lines();
+        assert!(lines[0].contains("[truncated"));
+        assert!(std::str::from_utf8(lines[0].as_bytes()).is_ok());
+        assert!(lines.iter().map(|line| line.len()).sum::<usize>() <= MAX_TUI_LOG_BYTES);
+        assert_eq!(lines.last().unwrap(), "small");
+    }
+
+    #[test]
+    fn tui_writer_discards_oldest_lines_to_stay_within_total_byte_budget() {
+        let writer = TuiLogWriter::new_for_test(10, 16, 10);
+        let mut sink = writer.make_writer();
+        sink.write_all(b"first\nsecond\nthird\n").unwrap();
+
+        assert_eq!(writer.lines(), vec!["third"]);
+    }
+
+    fn create_log(dir: &Path, day: NaiveDate, bytes: u64) {
+        let file = fs::File::create(log_path(dir, day)).unwrap();
+        file.set_len(bytes).unwrap();
+    }
+
+    #[test]
+    fn retains_only_the_latest_three_calendar_days() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        for day in 8..=12 {
+            create_log(
+                dir.path(),
+                NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
+                1,
+            );
+        }
+
+        prune_expired_log_files(dir.path(), today).unwrap();
+
+        assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 8).unwrap()).exists());
+        assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 9).unwrap()).exists());
+        assert!(log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()).exists());
+        assert!(log_path(dir.path(), today).exists());
+    }
+
+    #[test]
+    fn removes_oldest_logs_to_keep_total_at_ten_mebibytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        for day in 10..=12 {
+            create_log(
+                dir.path(),
+                NaiveDate::from_ymd_opt(2026, 7, day).unwrap(),
+                5 * 1024 * 1024,
+            );
+        }
+
+        run_log_maintenance(dir.path(), today, 0).unwrap();
+
+        assert!(!log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 10).unwrap()).exists());
+        assert!(log_path(dir.path(), NaiveDate::from_ymd_opt(2026, 7, 11).unwrap()).exists());
+        assert!(log_path(dir.path(), today).exists());
+    }
+
+    #[test]
+    fn appending_never_exceeds_ten_mebibytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        create_log(dir.path(), today, MAX_LOG_BYTES);
+
+        append_log(dir.path(), today, b"next event", true).unwrap();
+
+        assert!(fs::metadata(log_path(dir.path(), today)).unwrap().len() <= MAX_LOG_BYTES);
+    }
+
+    // ── retention runs on a budget, not on every record ────────
+    //
+    // `tracing` calls `write` once per log record, and the retention scan is
+    // several `read_dir` passes over the log directory. At debug level that
+    // turned every single log line into a directory walk.
+
+    #[test]
+    fn maintenance_runs_only_on_first_write_or_after_a_budget_is_spent() {
+        let now = Instant::now();
+        assert!(maintenance_due(None, now, 0));
+        assert!(!maintenance_due(Some(now), now, 64));
+        assert!(maintenance_due(Some(now), now, MAINTENANCE_BYTE_BUDGET));
+        let last = now.checked_sub(MAINTENANCE_INTERVAL).unwrap();
+        assert!(maintenance_due(Some(last), now, 1));
+    }
+
+    /// The wiring, not just the decision: a write that is not due must leave
+    /// out-of-retention files alone, and a due one must still collect them.
+    #[test]
+    fn a_skipped_maintenance_write_does_not_scan_the_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        let expired = NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        create_log(dir.path(), expired, 1);
+
+        append_log(dir.path(), today, b"skipped\n", false).unwrap();
+        assert!(
+            log_path(dir.path(), expired).exists(),
+            "a write that is not due for maintenance must not walk the log directory"
+        );
+
+        append_log(dir.path(), today, b"due\n", true).unwrap();
+        assert!(
+            !log_path(dir.path(), expired).exists(),
+            "a write that is due must still apply retention"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_log_tightens_directory_lock_and_log_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 7, 12).unwrap();
+        let lock_path = dir.path().join(".lock");
+        let current_log = log_path(dir.path(), today);
+        fs::File::create(&lock_path).unwrap();
+        fs::File::create(&current_log).unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+        fs::set_permissions(&current_log, fs::Permissions::from_mode(0o666)).unwrap();
+
+        append_log(dir.path(), today, b"private event", true).unwrap();
+
+        assert_eq!(
+            fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(current_log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}

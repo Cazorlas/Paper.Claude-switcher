@@ -1,0 +1,7 @@
+/target
+/temp
+.claude/
+.AIINFO/
+npm/README.md
+npm/LICENSE
+npm/THIRD_PARTY_NOTICES.md

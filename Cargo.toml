@@ -1,0 +1,86 @@
+[package]
+name = "paper-claude-switch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Claude Code account switcher - multi-profile manager with usage dashboard"
+license = "MIT"
+repository = "https://github.com/Cazorlas/Paper.Claude-switcher"
+keywords = ["claude", "anthropic", "account", "switcher", "cli"]
+categories = ["command-line-utilities"]
+
+[lib]
+name = "claude_switch"
+path = "src/lib.rs"
+
+[[bin]]
+name = "paper-claude-switch"
+test = false
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "7"
+sha2 = "0.11"
+hex = "0.4"
+base64 = "0.23"
+flate2 = "1"
+semver = "1"
+reqwest = { version = "0.12", features = [
+    "json",
+    # Both root stores, not one: the OS trust store is what makes an
+    # intercepting proxy's CA work the way it already does for curl and the
+    # browser, while the bundled Mozilla list keeps a slim container that ships
+    # no ca-certificates from losing HTTPS entirely.
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+    "socks",
+    # Off by default here because default-features is disabled; without it a
+    # macOS user whose proxy lives in System Settings (rather than in the
+    # environment or --proxy) gets connection failures the browser does not.
+    "macos-system-configuration",
+], default-features = false }
+self-replace = "1"
+tempfile = "3"
+webbrowser = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+ratatui = "0.30"
+crossterm = "0.29"
+urlencoding = "2"
+toml = "1"
+rand = "0.10"
+fs4 = "1.1.0"
+chrono = { version = "0.4", features = ["clock"] }
+supports-color = "3"
+owo-colors = "4"
+tar = "0.4"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+libc = "0.2"
+rpassword = "7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["clock"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

@@ -1,0 +1,50 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, asset: paper-codex-switch-windows-x64.exe, bin: paper-codex-switch.exe }
+          - { os: macos-latest, target: x86_64-apple-darwin, asset: paper-codex-switch-macos-x64, bin: paper-codex-switch }
+          - { os: macos-latest, target: aarch64-apple-darwin, asset: paper-codex-switch-macos-arm64, bin: paper-codex-switch }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, asset: paper-codex-switch-linux-x64, bin: paper-codex-switch }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - shell: bash
+        run: cp target/${{ matrix.target }}/release/${{ matrix.bin }} ${{ matrix.asset }}
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ matrix.asset }}
+
+  publish-npm:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm trusted publishing (OIDC), no token needed
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Version must match the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ "$tag" = "$cargo_version" ] || { echo "tag $tag != Cargo.toml $cargo_version"; exit 1; }
+          cd npm && npm version "$tag" --no-git-tag-version --allow-same-version
+      - name: Package files
+        run: cp README.md LICENSE THIRD_PARTY_NOTICES.md npm/
+      - name: Point README image at GitHub
+        run: sed -i 's|(docs/list.png)|(https://raw.githubusercontent.com/Cazorlas/Paper.Codex-switcher/main/docs/list.png)|' npm/README.md
+      - run: npm publish --access public
+        working-directory: npm
