@@ -1,282 +1,184 @@
 use super::render::{confirm_default_no, print_usage_line};
+use crate::claude_store::{self, LiveAccount, LockOptions, SwitchOutcome};
+use crate::claude_usage;
 use crate::output::{
     self, ProgressReporter, account_to_json, print_json, usage_to_json, user_println,
 };
-use crate::{auth, cache, color, config, jwt, profile, usage, workspace};
+use crate::{auth, cache, color, config, jwt, profile, usage};
 use anyhow::{Context, Result};
 
+/// The live Claude login and the saved profiles, with the active profile
+/// resolved by account uuid.
+struct Accounts {
+    paths: claude_store::ClaudePaths,
+    live: Option<LiveAccount>,
+    profiles: Vec<claude_usage::Profile>,
+    active: Option<String>,
+}
 
+impl Accounts {
+    fn load() -> Result<Self> {
+        let paths = claude_usage::paths()?;
+        let live = claude_store::read_live(&paths)?;
+        let mut profiles = claude_usage::profiles()?;
+        let active = claude_usage::active_alias(&profiles, live.as_ref())?;
+        // The live plan is fresher than the one stored with the active profile.
+        if let (Some(live), Some(active)) = (&live, &active) {
+            if let Some(plan) = live.oauth["subscriptionType"].as_str() {
+                for p in profiles.iter_mut().filter(|p| &p.alias == active) {
+                    p.info.plan_type = Some(plan.to_owned());
+                }
+            }
+        }
+        Ok(Self { paths, live, profiles, active })
+    }
 
-/// Surface profiles whose rotated credentials could not be written.
-///
-/// The auth server has already invalidated their previous refresh token, so
-/// staying quiet hands the user an account that stops working later with no
-/// clue why. Printed to stderr so `--json` stdout stays machine-readable.
-fn report_token_persist_failures(failures: &[usage::TokenPersistFailure]) {
-    for failure in failures {
-        eprintln!(
-            "{}",
-            color::error(&format!("Warning: {}", failure.error.detail))
+    fn live_oauth(&self) -> Option<&LiveAccount> {
+        self.live.as_ref()
+    }
+
+    fn find(&self, alias: &str) -> Option<&claude_usage::Profile> {
+        self.profiles.iter().find(|p| p.alias == alias)
+    }
+
+    fn switch(&self, alias: &str) -> Result<SwitchOutcome> {
+        if let Some(live) = &self.live {
+            if self.active.is_none() {
+                anyhow::bail!(
+                    "the live Claude account ({}) is not saved; run `paper-claude-switch login` first",
+                    live.email.as_deref().unwrap_or("unknown email")
+                );
+            }
+        }
+        let outcome = claude_store::switch_to(
+            &self.paths,
+            &auth::app_home()?,
+            alias,
+            &LockOptions::default(),
+        )?;
+        cache::set_last_used(alias)?;
+        tracing::info!(
+            action = "switch",
+            alias,
+            outcome = "completed",
+            "account switched"
         );
+        Ok(outcome)
     }
 }
 
 // ── use ──────────────────────────────────────────────────
 
 pub(crate) async fn use_cmd(alias: Option<&str>, json: bool) -> Result<()> {
-    use std::io::IsTerminal;
-
-    auth::ensure_file_credentials_store()?;
-
+    let Some(requested) = alias else {
+        return best_cmd(json).await;
+    };
+    let accounts = Accounts::load()?;
     // `use 2` picks the 2nd profile in `list` order (1-based), unless a profile is
     // literally named "2".
-    let by_index = alias.and_then(resolve_profile_index);
-    let alias = by_index.as_deref().or(alias);
-    match alias {
-        Some(a) => {
-            profile::cmd_use(a, !json && std::io::stdin().is_terminal())?;
-            cache::set_last_used(a)?;
-            tracing::info!(
-                action = "switch",
-                alias = a,
-                outcome = "completed",
-                "account switched"
-            );
-            if json {
-                print_json(&output::JsonOk {
-                    ok: true,
-                    alias: a.to_string(),
-                    action: "switched".into(),
-                });
-            }
-        }
-        None => best_cmd(json).await?,
+    let by_index = resolve_profile_index(requested, &accounts.profiles);
+    let alias = by_index.as_deref().unwrap_or(requested);
+    let outcome = accounts.switch(alias)?;
+    let action = match outcome {
+        SwitchOutcome::Switched { .. } => "switched",
+        SwitchOutcome::AlreadyActive => "already_active",
+    };
+    if json {
+        print_json(&output::JsonOk {
+            ok: true,
+            alias: alias.to_string(),
+            action: action.into(),
+        });
+    }
+    // Human message too: stdout in text mode, stderr beside the JSON report.
+    if action == "switched" {
+        user_println(&color::success(&format!("Switched to: {alias}")));
+    } else {
+        user_println(&color::dim(&format!("Already using: {alias}")));
     }
     Ok(())
 }
 
 /// Map a 1-based position in `list` order to a profile alias. `None` when the
 /// text is not a number, is out of range, or names an existing profile.
-fn resolve_profile_index(text: &str) -> Option<String> {
+fn resolve_profile_index(text: &str, profiles: &[claude_usage::Profile]) -> Option<String> {
     let n: usize = text.parse().ok()?;
-    let profiles = profile::list_profiles().ok()?;
-    if profiles.iter().any(|p| p == text) {
+    if profiles.iter().any(|p| p.alias == text) {
         return None;
     }
-    profiles.get(n.checked_sub(1)?).cloned()
+    profiles.get(n.checked_sub(1)?).map(|p| p.alias.clone())
 }
 
 // ── list (all profiles + usage, concurrent) ──────────────
 
-pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool) -> Result<()> {
-    if !auth_already_handled {
-        profile::auto_track_current();
-    }
-
-    let profiles = profile::list_profiles()?;
-    if profiles.is_empty() {
+pub(crate) async fn list_cmd(force: bool, json: bool) -> Result<()> {
+    let accounts = Accounts::load()?;
+    if accounts.profiles.is_empty() {
         if json {
             print_json(&output::JsonUsageResult { profiles: vec![] });
         } else {
             println!(
                 "{}",
-                color::dim(
-                    "(no saved profiles; run `paper-claude-switch login`)"
-                )
+                color::dim("(no saved profiles; run `paper-claude-switch login`)")
             );
         }
         return Ok(());
     }
 
-    let current = profile::read_current();
-
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        config::get().network.max_concurrent,
-    ));
-
-    struct ListRow {
-        name: String,
-        is_current: bool,
-        info: jwt::AccountInfo,
-        usage_result: Option<std::result::Result<usage::UsageInfo, usage::UsageError>>,
-    }
-
-    let mut rows: Vec<ListRow> = profiles
-        .into_iter()
-        .filter_map(|name| {
-            let path = match profile::profile_auth_path(&name) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("[{name}] failed to resolve profile path: {e}");
-                    return None;
-                }
-            };
-            let info = auth::read_account_info(&path);
-            let usage_result = if force {
-                None
-            } else {
-                cache::get(&name).map(Ok)
-            };
-            Some(ListRow {
-                is_current: name == current,
-                name,
-                info,
-                usage_result,
-            })
-        })
-        .collect();
-
-    let refresh_count = rows.iter().filter(|row| row.usage_result.is_none()).count();
+    // Only accounts without a fresh cache entry need a network round trip.
+    let stale = accounts
+        .profiles
+        .iter()
+        .filter(|p| force || cache::get(&p.alias).is_none())
+        .count();
     let mut progress = if json {
         None
     } else {
-        Some(ProgressReporter::new("Refreshing usage", refresh_count))
+        Some(ProgressReporter::new("Refreshing usage", stale))
     };
-
-    let mut tasks = tokio::task::JoinSet::new();
-    for (idx, row) in rows.iter().enumerate() {
-        let needs_usage = row.usage_result.is_none();
-        let needs_workspace = force
-            || row
-                .info
-                .account_id
-                .as_deref()
-                .is_some_and(|id| !cache::workspace_name_is_known(id));
-        if !needs_usage && !needs_workspace {
-            continue;
-        }
-
-        let alias = row.name.clone();
-        let current = current.clone();
-        let sem = semaphore.clone();
-        tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return (
-                    idx,
-                    needs_usage.then(|| {
-                        Err(usage::UsageError {
-                            summary: "limiter closed".into(),
-                            detail: "usage limiter closed".into(),
-                        })
-                    }),
-                );
-            };
-            let path = match profile::profile_auth_path(&alias) {
-                Ok(p) => p,
-                Err(e) => {
-                    return (
-                        idx,
-                        needs_usage.then(|| {
-                            Err(usage::UsageError {
-                                summary: format!("path error: {e}"),
-                                detail: format!("failed to resolve profile path: {e}"),
-                            })
-                        }),
-                    );
-                }
-            };
-            let usage_result = if needs_usage {
-                Some(if force {
-                    usage::fetch_usage_retried_force(&alias, &path, &current).await
-                } else {
-                    usage::fetch_usage_retried(&alias, &path, &current).await
-                })
-            } else {
-                None
-            };
-            // Read auth after usage: that path may have refreshed and persisted the token.
-            if let Ok(auth) = auth::read_auth(&path)
-                && let Err(err) = workspace::refresh_for_auth_if_needed(&auth, force).await
-            {
-                tracing::debug!("[{alias}] workspace metadata unavailable: {err}");
-            }
-            (idx, usage_result)
-        });
-    }
-
-    let mut completed = 0usize;
-    while let Some(task) = tasks.join_next().await {
-        let (idx, usage_result) = task.map_err(|e| anyhow::anyhow!("usage worker failed: {e}"))?;
-        if let Some(usage_result) = usage_result {
-            rows[idx].usage_result = Some(usage_result);
-            completed += 1;
-        }
-        cache::apply_workspace_name(&mut rows[idx].info);
-        if let Some(progress) = progress.as_mut() {
-            progress.advance(completed);
-        }
-    }
-
+    let results = claude_usage::fetch_all(
+        &accounts.profiles,
+        accounts.active.as_deref(),
+        accounts.live_oauth(),
+        force,
+    )
+    .await;
     if let Some(progress) = progress.as_mut() {
+        progress.advance(stale);
         progress.finish();
     }
 
     let mut json_items = vec![];
-
-    for (position, row) in rows.into_iter().enumerate() {
-        let usage_result = row.usage_result.unwrap_or_else(|| {
-            Err(usage::UsageError {
-                summary: "unknown".into(),
-                detail: "usage result missing".into(),
-            })
-        });
+    for (position, (p, usage_result)) in accounts.profiles.iter().zip(results).enumerate() {
+        let is_current = accounts.active.as_deref() == Some(p.alias.as_str());
         if json {
             let ju = match &usage_result {
                 Ok(u) => usage_to_json(Ok(u)),
                 Err(e) => usage_to_json(Err(&e.detail)),
             };
             json_items.push(output::JsonProfileWithUsage {
-                alias: row.name,
-                is_current: row.is_current,
-                account: account_to_json(
-                    &row.info,
-                    usage_result
-                        .as_ref()
-                        .ok()
-                        .and_then(|u| u.plan_type.as_deref()),
-                ),
+                alias: p.alias.clone(),
+                is_current,
+                account: account_to_json(&p.info, None),
                 usage: ju,
             });
         } else {
-            let mark = if row.is_current {
+            let mark = if is_current {
                 color::active("*")
             } else {
                 " ".to_string()
             };
-            let alias_str = if row.is_current {
-                color::bold(&row.name)
+            let alias_str = if is_current {
+                color::bold(&p.alias)
             } else {
-                row.name.clone()
+                p.alias.clone()
             };
             print!("{mark} {} {alias_str}", color::dim(&format!("{}.", position + 1)));
-            if let Some(email) = &row.info.email {
+            if let Some(email) = &p.info.email {
                 print!("  {}", color::dim(email));
             }
-            // API plan_type is authoritative over JWT claims (handles plan downgrades)
-            let effective_plan = if let Ok(u) = &usage_result {
-                u.plan_type.as_deref().or(row.info.plan_type.as_deref())
-            } else {
-                row.info.plan_type.as_deref()
-            };
-            if effective_plan.is_some() {
-                let label = if let Ok(u) = &usage_result
-                    && u.plan_type.is_some()
-                {
-                    row.info.plan_label_with(u.plan_type.as_deref())
-                } else {
-                    row.info.plan_label()
-                };
-                print!("  {}", color::plan(&label, effective_plan));
-            }
-            let (exp_text, exp_level) =
-                jwt::subscription_label(row.info.subscription_until, auth::now_unix_secs());
-            if exp_level != jwt::ExpiryLevel::Unknown {
-                let text = format!("until {exp_text}");
-                match exp_level {
-                    jwt::ExpiryLevel::Soon => print!("  {}", color::warn(&text)),
-                    jwt::ExpiryLevel::Past => print!("  {}", color::dim(&text)),
-                    _ => print!("  {}", color::dim(&text)),
-                }
+            if let Some(plan) = p.info.plan_type.as_deref() {
+                print!("  {}", color::plan(plan, Some(plan)));
             }
             println!();
             match usage_result {
@@ -292,10 +194,6 @@ pub(crate) async fn list_cmd(force: bool, json: bool, auth_already_handled: bool
             profiles: json_items,
         });
     }
-
-    // Opportunistically refresh tokens about to expire (background, bounded)
-    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
-
     Ok(())
 }
 
@@ -380,23 +278,14 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
 
 // ── best (internal, called by `use` with no alias) ────────
 
-pub(crate) fn score_profile_candidates(
-    fetched: Vec<(String, usage::UsageInfo)>,
+/// Score and order candidates: eligible first, then by score, least recently
+/// used, and alias.
+pub(crate) fn rank_candidates(
+    items: Vec<(String, usage::UsageInfo, jwt::AccountInfo, i64)>,
     now: i64,
     safety_7d: f64,
     team_priority: bool,
 ) -> Vec<(usage::Candidate, usage::UsageInfo, f64)> {
-    let items = fetched
-        .into_iter()
-        .map(|(alias, u)| {
-            let info = profile::profile_auth_path(&alias)
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let last_used = cache::get_last_used(&alias);
-            (alias, u, info, last_used)
-        })
-        .collect();
-
     let mut scored: Vec<(usage::Candidate, usage::UsageInfo, f64)> =
         usage::score_candidates(items, now, safety_7d, team_priority)
             .into_iter()
@@ -414,6 +303,25 @@ pub(crate) fn score_profile_candidates(
     });
 
     scored
+}
+
+pub(crate) fn score_profile_candidates(
+    fetched: Vec<(String, usage::UsageInfo)>,
+    now: i64,
+    safety_7d: f64,
+    team_priority: bool,
+) -> Vec<(usage::Candidate, usage::UsageInfo, f64)> {
+    let items = fetched
+        .into_iter()
+        .map(|(alias, u)| {
+            let info = profile::profile_auth_path(&alias)
+                .map(|p| auth::read_account_info(&p))
+                .unwrap_or_default();
+            let last_used = cache::get_last_used(&alias);
+            (alias, u, info, last_used)
+        })
+        .collect();
+    rank_candidates(items, now, safety_7d, team_priority)
 }
 
 pub(crate) async fn select_best_profile(
@@ -509,25 +417,64 @@ pub(crate) struct SelectOutcome {
 }
 
 async fn best_cmd(json: bool) -> Result<()> {
-    let outcome = select_best_profile(json).await?;
-    let SelectOutcome {
-        alias: best_alias,
-        usage: best_usage,
-        score: best_score,
-    } = outcome;
+    let accounts = Accounts::load()?;
+    if accounts.profiles.is_empty() {
+        anyhow::bail!("no saved profiles; run `paper-claude-switch login` first");
+    }
 
-    profile::switch_profile(&best_alias)?;
-    cache::set_last_used(&best_alias)?;
-    tracing::info!(
-        action = "switch",
-        alias = %best_alias,
-        outcome = "completed",
-        selection = "automatic",
-        "account switched"
+    let mut progress = if json {
+        None
+    } else {
+        Some(ProgressReporter::new(
+            "Testing accounts",
+            accounts.profiles.len(),
+        ))
+    };
+    let results = claude_usage::fetch_all(
+        &accounts.profiles,
+        accounts.active.as_deref(),
+        accounts.live_oauth(),
+        false,
+    )
+    .await;
+    if let Some(progress) = progress.as_mut() {
+        progress.finish();
+    }
+
+    let mut items = Vec::new();
+    for (p, result) in accounts.profiles.iter().zip(results) {
+        match result {
+            Ok(u) => items.push((
+                p.alias.clone(),
+                u,
+                p.info.clone(),
+                cache::get_last_used(&p.alias),
+            )),
+            Err(e) => tracing::warn!("[{}] usage fetch failed during auto-select: {}", p.alias, e),
+        }
+    }
+    if items.is_empty() {
+        anyhow::bail!("all usage queries failed");
+    }
+
+    let cfg = config::get();
+    let scored = rank_candidates(
+        items,
+        auth::now_unix_secs(),
+        cfg.use_cfg.safety_margin_7d,
+        cfg.use_cfg.team_priority,
     );
+    let (top, best_usage, best_score) = scored
+        .into_iter()
+        .next()
+        .context("failed to select best profile")?;
+    let best_alias = top.alias;
 
-    let path = profile::profile_auth_path(&best_alias)?;
-    let info = auth::read_account_info(&path);
+    accounts.switch(&best_alias)?;
+    let info = accounts
+        .find(&best_alias)
+        .map(|p| p.info.clone())
+        .unwrap_or_default();
 
     if json {
         print_json(&output::JsonBest {
@@ -542,10 +489,5 @@ async fn best_cmd(json: bool) -> Result<()> {
         println!("{}", color::success(&format!("Switched to: {best_alias}")));
         print_usage_line(&best_usage);
     }
-
-    // Opportunistically refresh tokens about to expire (background, bounded)
-    report_token_persist_failures(&usage::refresh_expiring_tokens().await);
-
     Ok(())
 }
-

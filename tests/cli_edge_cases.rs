@@ -1,7 +1,9 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,6 +81,71 @@ fn write_cache_entry(
     write_json(home.join(".paper-claude-switch/cache.json"), &cache);
 }
 
+/// Claude OAuth block whose access token is valid until the year 2100, so
+/// listing never tries to refresh it.
+fn claude_oauth(token: &str) -> Value {
+    serde_json::json!({
+        "accessToken": token,
+        "refreshToken": format!("refresh-{token}"),
+        "expiresAt": 4_102_444_800_000_i64,
+        "subscriptionType": "pro"
+    })
+}
+
+fn claude_account(email: &str, uuid: &str) -> Value {
+    serde_json::json!({"accountUuid": uuid, "emailAddress": email})
+}
+
+/// The account Claude Code is logged in to (CLAUDE_CONFIG_DIR is `<home>/.claude`).
+fn write_live_login(home: &Path, email: &str, uuid: &str, token: &str) {
+    write_json(
+        home.join(".claude/.credentials.json"),
+        &serde_json::json!({"claudeAiOauth": claude_oauth(token)}),
+    );
+    write_json(
+        home.join(".claude/.claude.json"),
+        &serde_json::json!({"oauthAccount": claude_account(email, uuid)}),
+    );
+}
+
+fn write_claude_profile(home: &Path, alias: &str, email: &str, uuid: &str, token: &str) {
+    let dir = home.join(".paper-claude-switch/profiles").join(alias);
+    write_json(
+        dir.join("credentials.json"),
+        &serde_json::json!({"claudeAiOauth": claude_oauth(token)}),
+    );
+    write_json(dir.join("account.json"), &claude_account(email, uuid));
+}
+
+/// A local endpoint that answers every request with 401, so usage lookups
+/// fail fast and never leave the machine.
+fn dead_endpoint() -> &'static str {
+    static BASE: OnceLock<String> = OnceLock::new();
+    BASE.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut seen = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => seen.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                });
+            }
+        });
+        base
+    })
+}
+
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_paper-claude-switch")
 }
@@ -89,7 +156,12 @@ fn command(home: &Path, args: &[&str]) -> Command {
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     cmd.env("HOME", home);
+    cmd.env("USERPROFILE", home);
     cmd.env("CODEX_HOME", home.join(".codex"));
+    cmd.env("CLAUDE_CONFIG_DIR", home.join(".claude"));
+    cmd.env("CS_CLAUDE_API_BASE", dead_endpoint());
+    cmd.env("CS_CLAUDE_TOKEN_URL", format!("{}/token", dead_endpoint()));
+    cmd.env("NO_COLOR", "1");
     cmd.env("PAPER_CLAUDE_SWITCH_HOME", home.join(".paper-claude-switch"));
     cmd.env_remove("HTTP_PROXY");
     cmd.env_remove("HTTPS_PROXY");
@@ -204,24 +276,19 @@ fn parse_stdout_json(output: &Output) -> Value {
 #[test]
 fn json_use_keeps_stdout_machine_readable() {
     let home = temp_home("json-use");
-    write_json(
-        home.join(".paper-claude-switch/profiles/alice/auth.json"),
-        &auth_json("alice@example.com", "acct_alice"),
-    );
-    write_json(
-        home.join(".codex/auth.json"),
-        &auth_json("alice@example.com", "acct_alice"),
-    );
+    write_live_login(&home, "alice@example.com", "U_alice", "tokAlice");
+    write_claude_profile(&home, "alice", "alice@example.com", "U_alice", "tokAlice");
+    write_claude_profile(&home, "bob", "bob@example.com", "U_bob", "tokBob");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "alice").unwrap();
 
-    let output = run(&home, &["--json", "use", "alice"]);
+    let output = run(&home, &["--json", "use", "bob"]);
     assert!(output.status.success());
     assert_eq!(
         parse_stdout_json(&output),
-        serde_json::json!({"ok": true, "alias": "alice", "action": "switched"})
+        serde_json::json!({"ok": true, "alias": "bob", "action": "switched"})
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Switched to profile: alice"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Switched to: bob"));
 
     let _ = fs::remove_dir_all(home);
 }
@@ -229,14 +296,8 @@ fn json_use_keeps_stdout_machine_readable() {
 #[test]
 fn json_use_rejects_untracked_live_auth_without_prompting() {
     let home = temp_home("json-use-untracked");
-    write_json(
-        home.join(".paper-claude-switch/profiles/alice/auth.json"),
-        &auth_json("alice@example.com", "acct_alice"),
-    );
-    write_json(
-        home.join(".codex/auth.json"),
-        &auth_json("bob@example.com", "acct_bob"),
-    );
+    write_claude_profile(&home, "alice", "alice@example.com", "U_alice", "tokAlice");
+    write_live_login(&home, "bob@example.com", "U_bob", "tokBob");
 
     let output = run(&home, &["--json", "use", "alice"]);
     assert!(!output.status.success());
@@ -244,7 +305,7 @@ fn json_use_rejects_untracked_live_auth_without_prompting() {
         parse_stdout_json(&output),
         serde_json::json!({
             "ok": false,
-            "error": "current auth.json is not tracked; interactive confirmation is required before overwriting it"
+            "error": "the live Claude account (bob@example.com) is not saved; run `paper-claude-switch login` first"
         })
     );
     assert!(!String::from_utf8_lossy(&output.stderr).contains("[y/N]"));
@@ -255,24 +316,38 @@ fn json_use_rejects_untracked_live_auth_without_prompting() {
 #[test]
 fn json_list_auto_track_keeps_stdout_machine_readable() {
     let home = temp_home("json-list");
+    // Claude Code is logged in to an account that has no profile; carol is saved
+    // but her credentials carry no access token.
+    write_live_login(&home, "dave@example.com", "U_dave", "tokDave");
+    write_claude_profile(&home, "carol", "carol@example.com", "U_carol", "unused");
+    let mut credentials: Value = serde_json::from_str(
+        &fs::read_to_string(home.join(".paper-claude-switch/profiles/carol/credentials.json"))
+            .unwrap(),
+    )
+    .unwrap();
+    credentials["claudeAiOauth"]
+        .as_object_mut()
+        .unwrap()
+        .remove("accessToken");
     write_json(
-        home.join(".codex/auth.json"),
-        &auth_json("carol@example.com", "acct_carol"),
+        home.join(".paper-claude-switch/profiles/carol/credentials.json"),
+        &credentials,
     );
 
     let output = run(&home, &["--json", "list"]);
     assert!(output.status.success());
 
+    // The unsaved live account is neither announced on stdout nor saved.
     let stdout = parse_stdout_json(&output);
+    assert_eq!(stdout["profiles"].as_array().unwrap().len(), 1);
     assert_eq!(stdout["profiles"][0]["alias"], "carol");
-    assert_eq!(
-        stdout["profiles"][0]["usage"]["error"],
-        "no access_token in auth file"
+    assert!(
+        stdout["profiles"][0]["usage"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unauthorized")
     );
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("Saved profile: carol"));
-    assert!(stderr.contains("Auto-saved current account as profile: carol"));
+    assert!(!home.join(".paper-claude-switch/profiles/dave").exists());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -280,10 +355,7 @@ fn json_list_auto_track_keeps_stdout_machine_readable() {
 #[test]
 fn zero_max_concurrent_is_sanitized() {
     let home = temp_home("zero-max-concurrent");
-    write_json(
-        home.join(".paper-claude-switch/profiles/dave/auth.json"),
-        &auth_json("dave@example.com", "acct_dave"),
-    );
+    write_claude_profile(&home, "dave", "dave@example.com", "U_dave", "tokDave");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "dave").unwrap();
     fs::write(
@@ -484,10 +556,7 @@ fn automatic_use_without_profiles_explains_how_to_get_started() {
 #[test]
 fn json_list_uses_per_account_cached_refresh_time() {
     let home = temp_home("json-list-cache-ts");
-    write_json(
-        home.join(".paper-claude-switch/profiles/ivy/auth.json"),
-        &auth_json("ivy@example.com", "acct_ivy"),
-    );
+    write_claude_profile(&home, "ivy", "ivy@example.com", "U_ivy", "tokIvy");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "ivy").unwrap();
     fs::write(
@@ -518,13 +587,10 @@ fn json_list_uses_per_account_cached_refresh_time() {
 #[test]
 fn non_interactive_stdin_does_not_save_new_account() {
     let home = temp_home("non-interactive-new");
-    // Put an auth.json with no matching profile
-    write_json(
-        home.join(".codex/auth.json"),
-        &auth_json("notrack@example.com", "acct_notrack"),
-    );
+    // Put a live Claude login with no matching profile
+    write_live_login(&home, "notrack@example.com", "U_notrack", "tokNotrack");
 
-    // Non-JSON, stdin closed: startup check should detect NewAccount but NOT save
+    // Non-JSON, stdin closed: startup check should detect the new account but NOT save
     let output = command(&home, &["list"])
         .stdin(Stdio::null())
         .output()
@@ -534,11 +600,10 @@ fn non_interactive_stdin_does_not_save_new_account() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Should inform user about the new account (user_println goes to stdout in non-JSON mode)
     assert!(
-        stdout.contains("Detected new account"),
+        stdout.contains("Detected an unsaved Claude account"),
         "expected detection message in stdout, got: {stdout}"
     );
     // Should NOT have saved — no profiles directory should exist
-    // (auto_track_current is skipped because auth_already_handled=true)
     let profiles_dir = home.join(".paper-claude-switch/profiles");
     assert!(
         !profiles_dir.exists() || fs::read_dir(&profiles_dir).unwrap().count() == 0,
@@ -552,41 +617,31 @@ fn non_interactive_stdin_does_not_save_new_account() {
 fn non_interactive_stdin_does_not_update_existing_profile() {
     let home = temp_home("non-interactive-update");
     // Create profile for alice
-    write_json(
-        home.join(".paper-claude-switch/profiles/alice/auth.json"),
-        &auth_json("alice@example.com", "acct_alice"),
-    );
+    write_claude_profile(&home, "alice", "alice@example.com", "U_alice", "tokOld");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "alice").unwrap();
 
-    // Put updated auth.json (same identity, different tokens) in live location
-    let mut updated = auth_json("alice@example.com", "acct_alice");
-    updated["tokens"]["refresh_token"] = serde_json::json!("new-refresh-token");
-    updated["tokens"]["access_token"] = serde_json::json!("new-access-token");
-    write_json(home.join(".codex/auth.json"), &updated);
+    // Claude Code rotated the live tokens for the same account
+    write_live_login(&home, "alice@example.com", "U_alice", "tokRotated");
 
-    // Run with stdin closed — should detect but NOT update profile
+    // Run with stdin closed — listing must NOT copy the live tokens into the profile
     let output = command(&home, &["list"])
         .stdin(Stdio::null())
         .output()
         .unwrap();
     assert!(output.status.success());
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("credentials changed"),
-        "expected change detection message in stdout, got: {stdout}"
-    );
-
     // Profile file should still have the original content (not updated)
     let profile_content: Value = serde_json::from_str(
-        &fs::read_to_string(home.join(".paper-claude-switch/profiles/alice/auth.json")).unwrap(),
+        &fs::read_to_string(home.join(".paper-claude-switch/profiles/alice/credentials.json"))
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(
-        profile_content["tokens"]["refresh_token"], "dummy-refresh",
-        "profile refresh_token should not have been updated"
+        profile_content["claudeAiOauth"]["refreshToken"], "refresh-tokOld",
+        "profile refresh token should not have been updated"
     );
+    assert_eq!(profile_content["claudeAiOauth"]["accessToken"], "tokOld");
 
     let _ = fs::remove_dir_all(home);
 }
@@ -594,14 +649,8 @@ fn non_interactive_stdin_does_not_update_existing_profile() {
 #[test]
 fn list_progress_counts_only_stale_accounts() {
     let home = temp_home("list-progress-stale-only");
-    write_json(
-        home.join(".paper-claude-switch/profiles/fresh/auth.json"),
-        &auth_json("fresh@example.com", "acct_fresh"),
-    );
-    write_json(
-        home.join(".paper-claude-switch/profiles/stale/auth.json"),
-        &auth_json("stale@example.com", "acct_stale"),
-    );
+    write_claude_profile(&home, "fresh", "fresh@example.com", "U_fresh", "tokFresh");
+    write_claude_profile(&home, "stale", "stale@example.com", "U_stale", "tokStale");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "fresh").unwrap();
 

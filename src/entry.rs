@@ -1,6 +1,6 @@
 use crate::cli::{Cli, Commands, extract_launch_passthrough, merge_launch_args};
 use crate::output::{MessageMode, print_error, should_report_error, user_println};
-use crate::{auth, color, commands, config, logging, output, profile, tui};
+use crate::{auth, claude_store, claude_usage, color, commands, config, logging, output, tui};
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -34,12 +34,6 @@ fn log_filters(debug: bool, rust_log: Option<&str>) -> LogFilters {
         file: EnvFilter::new("claude_switch=info"),
         tui: EnvFilter::new("claude_switch=info"),
     }
-}
-
-/// Best-effort read of the `last_refresh` field from an auth.json at `path`.
-fn read_last_refresh(path: Result<std::path::PathBuf>) -> Option<String> {
-    let val = auth::read_auth(&path.ok()?).ok()?;
-    val.get("last_refresh")?.as_str().map(str::to_string)
 }
 
 pub async fn run_cli() {
@@ -162,6 +156,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::Launch { .. } => "launch",
         Commands::Tui => "tui",
         Commands::Open => "open",
+        Commands::Doctor => "doctor",
     }
 }
 
@@ -173,24 +168,19 @@ async fn dispatch(
     let command = command_name(&cmd);
     let started = std::time::Instant::now();
     tracing::debug!(command, "command started");
-    // Startup auth change detection — skip for commands that manage auth themselves
-    let auth_check = if !json {
-        let should_check = !matches!(
+    // Offer to save an unsaved live Claude account — skip for commands that manage it themselves
+    if !json
+        && !matches!(
             &cmd,
             Commands::Login { .. }
                 | Commands::SelfUpdate { .. }
                 | Commands::Open
                 | Commands::Launch { .. }
-        );
-        if should_check {
-            check_auth_change()
-        } else {
-            AuthCheckResult::NoChange
-        }
-    } else {
-        AuthCheckResult::NoChange
-    };
-    let auth_handled = !matches!(auth_check, AuthCheckResult::NoChange);
+                | Commands::Doctor
+        )
+    {
+        offer_to_save_live_account();
+    }
 
     match cmd {
         Commands::Use {
@@ -215,15 +205,13 @@ async fn dispatch(
             };
             commands::auto_cmd(opts).await?
         }
-        Commands::List { force } => commands::list_cmd(force, json, auth_handled).await?,
+        Commands::List { force } => commands::list_cmd(force, json).await?,
         Commands::Rename { old, new } => commands::rename_cmd(&old, &new, json)?,
         Commands::Restore { alias, as_alias } => {
             commands::restore_cmd(alias.as_deref(), as_alias.as_deref(), json)?
         }
         Commands::Delete { alias, yes } => commands::delete_cmd(&alias, yes, json)?,
-        Commands::Login { alias, device } => {
-            commands::login_cmd(alias.as_deref(), device, json).await?
-        }
+        Commands::Login { alias } => commands::login_cmd(alias.as_deref(), json)?,
         Commands::SelfUpdate {
             check,
             version,
@@ -246,26 +234,7 @@ async fn dispatch(
         }
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => commands::open_cmd()?,
-    }
-
-    // If startup check actually synced the profile, re-sync after command execution
-    // to capture any token refreshes that happened during the command.
-    if matches!(auth_check, AuthCheckResult::Synced) {
-        let current = profile::read_current();
-        if !current.is_empty()
-            && auth::codex_auth_path()
-                .ok()
-                .as_ref()
-                .and_then(|p| profile::find_matching_profile(p))
-                .is_none()
-            && let Err(e) = profile::update_profile_from_live(&current)
-            && e.downcast_ref::<profile::StaleLiveAuth>().is_some()
-        {
-            eprintln!(
-                "{}",
-                color::warn(&format!("Warning: post-command profile sync skipped: {e}"))
-            );
-        }
+        Commands::Doctor => commands::doctor_cmd(json)?,
     }
 
     tracing::info!(
@@ -279,98 +248,51 @@ async fn dispatch(
 
 // ── startup auth change detection ────────────────────────
 
-#[derive(Debug)]
-enum AuthCheckResult {
-    NoChange,
-    Detected, // change detected but not synced (non-interactive or user declined)
-    Synced,   // change detected and user accepted the sync
-}
-
-fn check_auth_change() -> AuthCheckResult {
+/// Claude Code is logged in to an account that has no saved profile: say so,
+/// and offer to save it when a person is at the keyboard.
+fn offer_to_save_live_account() {
     use std::io::{self, IsTerminal};
 
-    tracing::debug!("checking auth change");
-    let change = profile::detect_auth_change();
-    tracing::debug!(?change, "auth change detection done");
-    if matches!(change, profile::AuthChange::NoChange) {
-        return AuthCheckResult::NoChange;
+    let Some(live) = claude_usage::paths()
+        .ok()
+        .and_then(|paths| claude_store::read_live(&paths).ok().flatten())
+    else {
+        return;
+    };
+    let saved = claude_usage::profiles().is_ok_and(|profiles| {
+        profiles
+            .iter()
+            .any(|p| p.info.account_id.as_deref() == Some(live.account_uuid.as_str()))
+    });
+    if saved {
+        return;
     }
-
+    let label = live.email.as_deref().unwrap_or("unknown");
     // Non-interactive stdin — don't prompt, don't silently mutate state
     if !io::stdin().is_terminal() {
-        match &change {
-            profile::AuthChange::NewAccount => {
-                let info = auth::codex_auth_path()
-                    .map(|p| auth::read_account_info(&p))
-                    .unwrap_or_default();
-                let label = info.email.as_deref().unwrap_or("unknown");
-                user_println(&format!(
-                    "Detected new account ({label}) in auth.json (use `paper-claude-switch list` interactively to save)."
-                ));
-            }
-            profile::AuthChange::TokensUpdated { alias } => {
-                user_println(&format!(
-                    "auth.json credentials changed for profile '{alias}' (use `paper-claude-switch list` interactively to update)."
-                ));
-            }
-            profile::AuthChange::NoChange => unreachable!(),
-        }
-        return AuthCheckResult::Detected;
+        user_println(&format!(
+            "Detected an unsaved Claude account ({label}) (run `paper-claude-switch login` to save it)."
+        ));
+        return;
     }
-
-    let mut synced = false;
-
-    match change {
-        profile::AuthChange::NewAccount => {
-            let info = auth::codex_auth_path()
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let label = info.email.as_deref().unwrap_or("unknown");
-            user_println(&format!(
-                "Detected new account ({label}) in auth.json — not in any saved profile."
-            ));
-            if commands::confirm("Save as a new profile? [Y/n] ") {
-                match profile::cmd_save(None) {
-                    Ok(action) => {
-                        user_println(&format!("Profile {}: {}", action.action(), action.alias()));
-                        synced = true;
-                    }
-                    Err(e) => eprintln!("{}", color::error(&format!("Failed to save: {e}"))),
-                }
+    user_println(&format!(
+        "Detected an unsaved Claude account ({label}) — not in any saved profile."
+    ));
+    if commands::confirm("Save as a new profile? [Y/n] ") {
+        let saved = claude_usage::paths().and_then(|paths| {
+            claude_store::save_current(
+                &paths,
+                &auth::app_home()?,
+                None,
+                &claude_store::LockOptions::default(),
+            )
+        });
+        match saved {
+            Ok(claude_store::SaveAction::Created(alias) | claude_store::SaveAction::Updated(alias)) => {
+                user_println(&format!("Profile saved: {alias}"));
             }
+            Err(e) => eprintln!("{}", color::error(&format!("Failed to save: {e:#}"))),
         }
-        profile::AuthChange::TokensUpdated { alias } => {
-            let info = auth::codex_auth_path()
-                .map(|p| auth::read_account_info(&p))
-                .unwrap_or_default();
-            let label = info.email.as_deref().unwrap_or("unknown");
-            user_println(&format!(
-                "auth.json credentials changed for account '{alias}' ({label})."
-            ));
-            let live_ts = read_last_refresh(auth::codex_auth_path());
-            let profile_ts = read_last_refresh(profile::profile_auth_path(&alias));
-            let prompt = commands::format_resync_confirm_prompt(
-                &alias,
-                live_ts.as_deref(),
-                profile_ts.as_deref(),
-            );
-            if commands::confirm(&prompt) {
-                match profile::update_profile_from_live(&alias) {
-                    Ok(()) => {
-                        user_println(&format!("Profile '{alias}' updated."));
-                        synced = true;
-                    }
-                    Err(e) => eprintln!("{}", color::error(&format!("Failed to update: {e}"))),
-                }
-            }
-        }
-        profile::AuthChange::NoChange => unreachable!(),
-    }
-
-    if synced {
-        AuthCheckResult::Synced
-    } else {
-        AuthCheckResult::Detected
     }
 }
 

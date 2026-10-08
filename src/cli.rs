@@ -119,14 +119,10 @@ Examples:
         #[arg(long = "as", value_name = "NEW_ALIAS")]
         as_alias: Option<String>,
     },
-    /// Log in via browser or --device code flow; re-authorizes if alias already exists
+    /// Save the account Claude Code is logged in to (log in with `claude`, then `/login`, first)
     Login {
-        /// Profile alias -- if it already exists, re-authorizes it; otherwise creates a new profile
+        /// Profile alias (default: derived from the account email; a saved account keeps its alias)
         alias: Option<String>,
-
-        /// Use device code flow (for headless servers without a browser)
-        #[arg(long)]
-        device: bool,
     },
     /// Manually check GitHub Releases (`--check`) or update this binary
     #[command(
@@ -163,6 +159,8 @@ Example: paper-claude-switch launch work -- exec review")]
     Tui,
     /// Open the paper-claude-switch data directory (~/.paper-claude-switch, or $PAPER_CLAUDE_SWITCH_HOME) in the system file manager
     Open,
+    /// Check Claude Code, the credentials location and the current login
+    Doctor,
 }
 
 /// Split `paper-claude-switch launch …` so Codex argv is never parsed as a
