@@ -332,7 +332,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         .accounts
         .iter()
         .any(|entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.primary.is_some()));
-    // The session-limit reset column only appears once an account has an offer.
+    // The session-limit reset column appears once any account reports its reset state.
     let show_reset = app.accounts.iter().any(
         |entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.session_reset.is_some()),
     );

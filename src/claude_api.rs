@@ -177,7 +177,7 @@ pub async fn fetch_usage(
 ) -> Result<ClaudeUsage, UsageError> {
     let response = client
         .get(format!(
-            "{}/api/oauth/usage",
+            "{}/api/oauth/usage?at_wall=1",
             ep.api_base.trim_end_matches('/')
         ))
         .bearer_auth(access_token)

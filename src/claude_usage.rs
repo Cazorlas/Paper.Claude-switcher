@@ -56,10 +56,21 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
 /// Table cell for the session-limit reset offer: `ready` (with `N/wk` when
 /// more than one reset a week), `next MM-DD HH:MM` in local time when it is
 /// used up for now, else `--`. The flag is true when a reset can be used now.
+/// Reset-column cell and whether a reset can be claimed now. Before the
+/// 5-hour wall Claude reports `not_at_wall`, and asked from outside Claude
+/// Code it reports `surface` (the reset is only claimable in Claude Code); both
+/// show the weekly allowance. Any other refusal means this account gets none.
 pub fn session_reset_label(reset: Option<&SessionReset>) -> (String, bool) {
-    let Some(reset) = reset.filter(|reset| reset.eligible) else {
+    let Some(reset) = reset else {
         return ("--".into(), false);
     };
+    if !reset.eligible {
+        let text = match reset.ineligible_reason.as_deref() {
+            Some("not_at_wall" | "surface") => format!("{}/wk", reset.resets_per_week),
+            _ => "n/a".into(),
+        };
+        return (text, false);
+    }
     if reset.available {
         let text = if reset.resets_per_week > 1 {
             format!("ready {}/wk", reset.resets_per_week)
