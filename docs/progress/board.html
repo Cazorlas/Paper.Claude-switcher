@@ -26,12 +26,15 @@ code{font-family:var(--mono);font-size:13px}
 <div class="wrap"><table>
 <tr><th>Step</th><th>What</th><th>Status</th></tr>
 <tr><td>Plan</td><td>Clone the Rust scaffold of paper-codex-switch, swap Codex auth/usage for Claude Code's (facts from claude-swap)</td><td><span class="st done">done</span></td></tr>
-<tr><td>T1</td><td>Rename to paper-claude-switch; remove providers, warmup, reset cards, app-server, import, auto-swap launch</td><td><span class="st done">done (Codex + A finished: 500 tests pass)</span></td></tr>
-<tr><td>T2</td><td>Claude credential store: key-scoped swap of <code>claudeAiOauth</code> / <code>oauthAccount</code>, Claude Code locks, profiles (14 tests)</td><td><span class="st done">done: 15 tests pass (A added key-order test)</span></td></tr>
-<tr><td>T3</td><td>Usage API + OAuth refresh; never refresh the active account (15 tests)</td><td><span class="st running">tests locked; Codex implementing</span></td></tr>
-<tr><td>T4</td><td>Wire CLI, TUI, auto, doctor, launch onto the Claude store and API</td><td><span class="st todo">planned</span></td></tr>
-<tr><td>T5</td><td>README, npm package, CI, notices</td><td><span class="st todo">briefed</span></td></tr>
-<tr><td>Cleanup</td><td>Close collab session, remove worktrees</td><td><span class="st todo">planned</span></td></tr>
+<tr><td>T1</td><td>Rename to paper-claude-switch; remove providers, warmup, reset cards, app-server, import, auto-swap launch</td><td><span class="st done">done</span></td></tr>
+<tr><td>T2</td><td>Claude credential store: key-scoped swap of <code>claudeAiOauth</code> / <code>oauthAccount</code>, Claude Code locks, profiles; keeps <code>~/.claude.json</code> key order</td><td><span class="st done">done, 15 tests</span></td></tr>
+<tr><td>T3</td><td>Usage API + OAuth refresh; never refreshes the active account</td><td><span class="st done">done, 15 tests</span></td></tr>
+<tr><td>T5</td><td>README, npm package, CI, notices</td><td><span class="st done">done</span></td></tr>
+<tr><td>T4/T6</td><td>login, use, list, doctor on Claude (Codex sandbox could not link; moved to the Claude worker)</td><td><span class="st done">done, 10 tests</span></td></tr>
+<tr><td>T7</td><td>delete/restore/first-run save, auto, launch, TUI; cross-process lock</td><td><span class="st done">done, 10 tests</span></td></tr>
+<tr><td>T8</td><td>Refresh race re-check; delete dead Codex code, 12 unused crates; Claude wording in TUI and help</td><td><span class="st done">done, 3 tests</span></td></tr>
+<tr><td>Verify</td><td>All 246 tests pass, 0 warnings; Linux target compiles; end-to-end run in a temp folder (login, list, use, auto, launch, delete/restore, doctor); real <code>~/.claude</code> untouched</td><td><span class="st done">done</span></td></tr>
+<tr><td>Merge</td><td>Branch <code>collab/main/claude-switch</code> into <code>main</code></td><td><span class="st todo">waiting for the owner</span></td></tr>
 </table></div>
 </section>
 </main>
