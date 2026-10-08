@@ -1,9 +1,9 @@
 //! `auto`: watch the active account's quota and swap to a better one before
-//! Codex hits its usage limit (the claude-swap `cswap auto` model).
+//! Claude Code hits its usage limit (the claude-swap `cswap auto` model).
 
 use super::profile::{score_profile_candidates};
-use crate::{auth, cache, color, config, profile, usage};
-use anyhow::{Context, Result};
+use crate::{auth, cache, claude_store, claude_usage, color, config, profile, usage};
+use anyhow::Result;
 use std::time::{Duration, Instant};
 
 /// Exit codes for `auto --once`, so cron and scripts can branch on the result.
@@ -101,31 +101,17 @@ fn emit(opts: &AutoOptions, event: &str, detail: serde_json::Value, text: String
 
 /// Fetch usage for every profile (forced: a switch decision must not run on a
 /// stale cache) and rank them.
-async fn rank_pool(current: &str) -> Result<Vec<(usage::Candidate, usage::UsageInfo, f64)>> {
-    let profiles = profile::list_profiles()?;
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        config::get().network.max_concurrent,
-    ));
-    let mut tasks = tokio::task::JoinSet::new();
-    for alias in profiles {
-        let sem = semaphore.clone();
-        let current = current.to_string();
-        tasks.spawn(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
-            let path = profile::profile_auth_path(&alias).ok()?;
-            match usage::fetch_usage_retried_force(&alias, &path, &current).await {
-                Ok(u) => Some((alias, u)),
-                Err(e) => {
-                    tracing::warn!("[{alias}] usage fetch failed during auto-swap: {e}");
-                    None
-                }
-            }
-        });
-    }
+async fn rank_pool() -> Result<Vec<(usage::Candidate, usage::UsageInfo, f64)>> {
+    let live = claude_usage::paths().and_then(|paths| claude_store::read_live(&paths))?;
+    let profiles = claude_usage::profiles()?;
+    let active = claude_usage::active_alias(&profiles, live.as_ref())?;
+    let results =
+        claude_usage::fetch_all(&profiles, active.as_deref(), live.as_ref(), true).await;
     let mut fetched = Vec::new();
-    while let Some(done) = tasks.join_next().await {
-        if let Some(pair) = done.context("usage worker failed")? {
-            fetched.push(pair);
+    for (p, result) in profiles.iter().zip(results) {
+        match result {
+            Ok(u) => fetched.push((p.alias.clone(), u)),
+            Err(e) => tracing::warn!("[{}] usage fetch failed during auto-swap: {e}", p.alias),
         }
     }
     let cfg = config::get();
@@ -138,13 +124,11 @@ async fn rank_pool(current: &str) -> Result<Vec<(usage::Candidate, usage::UsageI
 }
 
 /// One check-and-maybe-switch decision (nothing is switched here).
-/// `current` is the account being watched; `marker` is the account whose
-/// credentials are live in auth.json (they differ during a `launch` session).
-pub(crate) async fn tick(opts: &AutoOptions, current: &str, marker: &str) -> Result<Decision> {
+/// `current` is the profile of the live Claude account.
+pub(crate) async fn tick(opts: &AutoOptions, current: &str) -> Result<Decision> {
     let cfg = config::get();
     let safety_7d = cfg.use_cfg.safety_margin_7d;
-    let path = profile::profile_auth_path(current)?;
-    let live = usage::fetch_usage_retried_force(current, &path, marker)
+    let live = usage::fetch_usage_retried_force(current)
         .await
         .map_err(|e| anyhow::anyhow!("usage check for '{current}' failed: {}", e.summary))?;
     let limited_now = live.account_limited;
@@ -163,13 +147,13 @@ pub(crate) async fn tick(opts: &AutoOptions, current: &str, marker: &str) -> Res
         return Ok(first);
     }
 
-    let pool = rank_pool(marker).await?;
+    let pool = rank_pool().await?;
     let ranked: Vec<_> = pool.iter().map(|(c, _, s)| (c.clone(), *s)).collect();
     Ok(decide(current, &ranked, limited_now, opts, safety_7d))
 }
 
 fn apply(current: &str, alias: &str) -> Result<bool> {
-    // Compare-and-swap: bail if another process moved the active marker.
+    // Compare-and-swap: bail if another process switched the live account.
     if !profile::switch_profile_if_current(current, alias)? {
         return Ok(false);
     }
@@ -184,7 +168,6 @@ fn apply(current: &str, alias: &str) -> Result<bool> {
 }
 
 pub(crate) async fn auto_cmd(opts: AutoOptions) -> Result<()> {
-    auth::ensure_file_credentials_store()?;
     if !opts.once && !opts.json {
         println!(
             "{}",
@@ -203,13 +186,14 @@ pub(crate) async fn auto_cmd(opts: AutoOptions) -> Result<()> {
     let mut last_blocked = false;
 
     loop {
-        let current = profile::read_current();
-        if current.is_empty() {
-            anyhow::bail!("no active profile; run `paper-claude-switch use <alias>` first");
-        }
+        let Some(current) = claude_usage::current_active() else {
+            anyhow::bail!(
+                "the live Claude account is not a saved profile; run `paper-claude-switch login` first"
+            );
+        };
         let in_cooldown = last_switch.is_some_and(|t| t.elapsed() < opts.cooldown);
 
-        let code = match tick(&opts, &current, &current).await {
+        let code = match tick(&opts, &current).await {
             Err(e) => {
                 // Fail safe: keep the current account and retry next tick.
                 emit(

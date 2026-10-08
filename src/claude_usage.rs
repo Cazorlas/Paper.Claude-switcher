@@ -5,7 +5,7 @@ use chrono::DateTime;
 use serde_json::Value;
 
 use crate::claude_api::{ClaudeUsage, Endpoints, UsageError as ApiError};
-use crate::claude_store::{ClaudePaths, LiveAccount};
+use crate::claude_store::{self, ClaudePaths, LiveAccount};
 use crate::usage::{AdditionalRateLimit, UsageError, UsageInfo, WindowUsage};
 
 pub fn paths() -> Result<ClaudePaths> {
@@ -87,7 +87,7 @@ pub fn profiles() -> Result<Vec<Profile>> {
     Ok(found)
 }
 
-fn read_profile(alias: &str) -> Result<Profile> {
+pub fn read_profile(alias: &str) -> Result<Profile> {
     let dir = crate::auth::profiles_dir()?.join(alias);
     let read = |name: &str| -> Result<Value> {
         let path = dir.join(name);
@@ -136,6 +136,50 @@ pub fn active_alias(profiles: &[Profile], live: Option<&LiveAccount>) -> Result<
     Ok(active)
 }
 
+/// The alias of the saved profile whose account is the live Claude login, read
+/// quietly (no warnings for broken profile folders) for the TUI and `auto`.
+pub fn current_active() -> Option<String> {
+    let live = claude_store::read_live(&paths().ok()?).ok().flatten();
+    let profiles: Vec<Profile> = crate::profile::list_profiles()
+        .ok()?
+        .iter()
+        .filter_map(|alias| read_profile(alias).ok())
+        .collect();
+    active_alias(&profiles, live.as_ref()).ok().flatten()
+}
+
+/// Usage for one saved profile by alias: the active account (by live
+/// accountUuid) is read with the live token, every other one with its saved
+/// token. `force` skips the usage cache.
+pub async fn fetch_alias(alias: &str, force: bool) -> Result<UsageInfo, UsageError> {
+    let failed = |summary: &str, error: anyhow::Error| UsageError {
+        summary: summary.to_owned(),
+        detail: format!("{error:#}"),
+    };
+    let profile = read_profile(alias).map_err(|e| failed("profile unreadable", e))?;
+    let live = paths()
+        .and_then(|paths| claude_store::read_live(&paths))
+        .map_err(|e| failed("Claude login unreadable", e))?;
+    let live_oauth = live
+        .as_ref()
+        .filter(|live| profile.info.account_id.as_deref() == Some(live.account_uuid.as_str()))
+        .map(|live| &live.oauth);
+    fetch(&profile, live_oauth, force).await
+}
+
+/// True when the saved token of an inactive profile is about to be refreshed.
+fn needs_refresh(profile: &Profile) -> bool {
+    let Ok(bytes) = std::fs::read(profile.dir.join("credentials.json")) else {
+        return false;
+    };
+    let Ok(credentials) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    credentials["claudeAiOauth"]["expiresAt"]
+        .as_i64()
+        .is_some_and(|expires| expires <= chrono::Utc::now().timestamp_millis() + 300_000)
+}
+
 /// Usage for one profile. `live_oauth` is Some only for the active profile,
 /// which is read with the live token and never refreshed from here.
 pub async fn fetch(
@@ -152,6 +196,24 @@ pub async fn fetch(
         summary: "HTTP client error".into(),
         detail: e.to_string(),
     })?;
+    // `auto` and the TUI may run in other processes: hold the app lock while a
+    // rotated token is refreshed and written, so a switch in another process
+    // never activates a token this one has just replaced. The refresh re-reads
+    // the profile file under the lock.
+    let _refresh_lock = if live_oauth.is_none() && needs_refresh(profile) {
+        let locked = tokio::task::spawn_blocking(crate::profile::lock_live_auth)
+            .await
+            .map_err(|e| UsageError {
+                summary: "lock failed".into(),
+                detail: e.to_string(),
+            })?;
+        Some(locked.map_err(|e| UsageError {
+            summary: "another switch is running".into(),
+            detail: format!("{e:#}"),
+        })?)
+    } else {
+        None
+    };
     let raw = crate::claude_api::usage_for_profile(
         &client,
         &endpoints(),

@@ -142,16 +142,16 @@ Examples:
         #[arg(long, conflicts_with = "dev")]
         stable: bool,
     },
-    /// Launch Codex CLI with a profile
-    #[command(after_help = "Credentials are staged for the session and restored after [launch] restore_delay_secs. Pass CLI arguments after --.
-Example: paper-claude-switch launch work -- exec review")]
+    /// Switch to a profile, then run Claude Code
+    #[command(after_help = "Pass Claude Code arguments after --.
+Example: paper-claude-switch launch work -- --resume")]
     Launch {
         /// Profile alias (omit to auto-select the best profile)
         alias: Option<String>,
-        /// For a ChatGPT profile, forwarded to Codex as `--model`.
-        #[arg(long)]
+        /// Always None; the `--model` flag was removed (pass it after `--`).
+        #[arg(skip)]
         model: Option<String>,
-        /// Codex argv; prefer `--` before this so flags are not parsed by paper-claude-switch
+        /// Claude Code argv; prefer `--` before this so flags are not parsed by paper-claude-switch
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -393,23 +393,6 @@ mod tests {
         assert_eq!(alias.as_deref(), Some("openrouter"));
         assert_eq!(model, None);
         assert_eq!(args, ["--model", "openai/gpt-5.3-codex"]);
-    }
-
-    #[test]
-    fn launch_cs_model_before_double_dash_is_kept_separate_from_passthrough() {
-        let (_, alias, model, args) = parse_launch(&[
-            "paper-claude-switch",
-            "launch",
-            "work",
-            "--model",
-            "gpt-5.4",
-            "--",
-            "exec",
-            "hi",
-        ]);
-        assert_eq!(alias.as_deref(), Some("work"));
-        assert_eq!(model.as_deref(), Some("gpt-5.4"));
-        assert_eq!(args, ["exec", "hi"]);
     }
 
     #[test]

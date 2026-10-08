@@ -17,7 +17,7 @@ use crate::jwt::AccountInfo;
 use crate::login;
 use crate::output::format_local_timestamp;
 use crate::profile::{
-    self, cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
+    cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
     switch_profile, sync_current_from_live, validate_alias,
 };
 use crate::usage::{
@@ -317,6 +317,10 @@ impl App {
                 return;
             }
         }
+        // Claude Code has no per-account model list to fetch.
+        if true {
+            return;
+        }
         let path = match profile_auth_path(alias) {
             Ok(p) => p,
             Err(_) => return,
@@ -477,26 +481,15 @@ impl App {
                 })
                 .collect(),
             Some(ModelStatus::Error(error)) => vec![format!("  error: {error}")],
-            _ => vec!["  loading...".to_string()],
+            _ => Vec::new(),
         };
         let auth_expiries = profile_auth_path(&entry.alias)
             .ok()
             .and_then(|path| auth::read_auth(&path).ok())
-            .map(|auth| {
+            .map(|credentials| {
                 let mut expiries = Vec::new();
-                if let Some(token) = auth::extract_id_token(&auth) {
-                    let expiry = crate::jwt::token_expires_at(&token)
-                        .map(crate::output::format_token_expiry)
-                        .unwrap_or_else(|| "not reported".into());
-                    expiries.push(format!("ID token · {expiry}"));
-                }
-                if let Some(token) = auth
-                    .pointer("/tokens/access_token")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    let expiry = crate::jwt::token_expires_at(token)
-                        .map(crate::output::format_token_expiry)
-                        .unwrap_or_else(|| "not reported".into());
+                if let Some(millis) = credentials["claudeAiOauth"]["expiresAt"].as_i64() {
+                    let expiry = crate::output::format_token_expiry(millis / 1000);
                     expiries.push(format!("Access token · {expiry}"));
                 }
                 expiries
@@ -797,7 +790,7 @@ impl App {
             }
             KeyCode::Char('a') => self.open_add_menu(),
             KeyCode::Char('o') if self.marked.is_empty() => {
-                if self.defer_while_switching("launching Codex") {
+                if self.defer_while_switching("launching Claude Code") {
                     return None;
                 }
                 return self.selected_account_idx().map(|idx| self.accounts[idx].alias.clone());
@@ -946,8 +939,11 @@ impl App {
                             continue;
                         }
                     };
+                    let _ = path;
                     accounts.push(AccountEntry {
-                        info: auth::read_account_info(&path),
+                        info: crate::claude_usage::read_profile(&alias)
+                            .map(|profile| profile.info)
+                            .unwrap_or_default(),
                         usage: retained_usage.remove(&alias).unwrap_or(UsageStatus::Idle),
                         is_current: alias == current,
                         alias,
@@ -1249,12 +1245,8 @@ impl App {
         let needs_usage =
             refresh_fetches_loaded_usage(refresh) || !matches!(entry.usage, UsageStatus::Loaded(_));
         let force_negative_caches = refresh_forces_negative_caches(refresh);
-        let needs_workspace = force_negative_caches
-            || entry
-                .info
-                .account_id
-                .as_deref()
-                .is_some_and(|id| !crate::cache::workspace_name_is_known(id));
+        // Claude accounts carry no workspace metadata to look up.
+        let needs_workspace = false;
         if !needs_usage && !needs_workspace {
             return;
         }
@@ -1267,7 +1259,6 @@ impl App {
                 return;
             }
         };
-        let current = read_current();
         let limiter = self.usage_limiter.clone();
 
         if needs_usage && !matches!(self.accounts[idx].usage, UsageStatus::Loaded(_)) {
@@ -1287,11 +1278,9 @@ impl App {
             if needs_usage {
                 let result = with_usage_limiter(&limiter, async {
                     match refresh {
-                        Refresh::Cached => fetch_usage_retried(&alias, &path, &current).await,
-                        Refresh::Unattended => {
-                            fetch_usage_retried_unattended(&alias, &path, &current).await
-                        }
-                        Refresh::Forced => fetch_usage_retried_force(&alias, &path, &current).await,
+                        Refresh::Cached => fetch_usage_retried(&alias).await,
+                        Refresh::Unattended => fetch_usage_retried_unattended(&alias).await,
+                        Refresh::Forced => fetch_usage_retried_force(&alias).await,
                     }
                 })
                 .await;
@@ -1438,7 +1427,7 @@ impl App {
             // lower-level credential operation panics while holding a lock.
             let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 match switch_profile(&alias) {
-                    Ok(()) => {
+                    Ok(_) => {
                         let last_used_error = cache::set_last_used(&alias)
                             .err()
                             .map(|error| error.to_string());
@@ -2201,7 +2190,6 @@ async fn dispatch_main_key(
                         terminal,
                         app,
                         alias,
-                        None,
                         Vec::new(),
                         shutdown,
                     )
@@ -2273,11 +2261,11 @@ async fn handle_menu_key(
             app.switch_selected();
         }
         MenuAction::Launch(alias) => {
-            if app.defer_while_switching("launching Codex") {
+            if app.defer_while_switching("launching Claude Code") {
                 return None;
             }
             app.close_menu();
-            return perform_launch(terminal, app, alias, None, Vec::new(), shutdown).await;
+            return perform_launch(terminal, app, alias, Vec::new(), shutdown).await;
         }
         MenuAction::ReloginRequest(alias, email) => {
             app.open_relogin_flow_menu(alias, email);
@@ -2374,30 +2362,24 @@ async fn perform_launch(
     terminal: &mut DefaultTerminal,
     app: &mut App,
     alias: String,
-    model: Option<String>,
     extra_args: Vec<String>,
     shutdown: &mut crate::signals::ShutdownListener,
 ) -> Option<crate::signals::ShutdownSignal> {
     suspend_tui_for_plain_output();
     crate::output::set_message_mode(crate::output::MessageMode::Stdout);
 
-    match &model {
-        Some(model) => println!("\n=== Launch Codex: {alias} / {model} ===\n"),
-        None => println!("\n=== Launch Codex: {alias} ===\n"),
-    }
+    println!("\n=== Launch Claude Code: {alias} ===\n");
 
-    let result =
-        crate::launch::launch_for_tui(&alias, model.as_deref(), extra_args, shutdown)
-            .await;
+    let result = crate::launch::launch_for_tui(&alias, extra_args, shutdown).await;
 
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
     match &result {
         Ok(crate::launch::TuiLaunchOutcome::Exited(0)) => {
-            println!("\nCodex exited successfully.")
+            println!("\nClaude Code exited successfully.")
         }
         Ok(crate::launch::TuiLaunchOutcome::Exited(exit_code)) => {
-            println!("\nCodex exited with code {exit_code}.")
+            println!("\nClaude Code exited with code {exit_code}.")
         }
         Ok(crate::launch::TuiLaunchOutcome::Shutdown { .. }) => {
             println!("\nShutdown requested.")
@@ -2418,7 +2400,7 @@ async fn perform_launch(
 
     match result {
         Ok(crate::launch::TuiLaunchOutcome::Exited(0)) => {
-            app.set_status(format!("Codex session ended ({alias})"), 4);
+            app.set_status(format!("Claude Code session ended ({alias})"), 4);
             if app.load_profiles_preserving_selection() {
                 app.refresh(Refresh::Cached);
             }
@@ -2427,7 +2409,7 @@ async fn perform_launch(
             }
         }
         Ok(crate::launch::TuiLaunchOutcome::Exited(exit_code)) => {
-            app.set_status_error(format!("Codex exited with code {exit_code}"), 5);
+            app.set_status_error(format!("Claude Code exited with code {exit_code}"), 5);
         }
         Ok(crate::launch::TuiLaunchOutcome::Shutdown {
             signal,
@@ -2635,58 +2617,25 @@ async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, de
     }
 }
 
-async fn run_oauth_inner(mode: OAuthMode, device: bool) -> Result<String> {
-    let tokens = if device {
-        login::run_device_code_auth().await?
-    } else {
-        login::run_device_auth().await?
+/// Claude Code owns the sign-in: log in with `claude` first, then this saves
+/// the live login as a new profile (add) or into the named one (re-login).
+async fn run_oauth_inner(mode: OAuthMode, _device: bool) -> Result<String> {
+    let paths = crate::claude_usage::paths()?;
+    let app_home = auth::app_home()?;
+    let alias = match &mode {
+        OAuthMode::Add => None,
+        OAuthMode::Relogin(alias) => Some(alias.as_str()),
     };
-    let (auth_val, info) = login::build_auth_from_tokens(&tokens);
-
-    match mode {
-        OAuthMode::Add => {
-            let refresh_auth = auth_val.clone();
-            finish_refresh_then_commit(
-                async {
-                    if let Err(err) = crate::workspace::refresh_for_auth(&refresh_auth).await {
-                        tracing::debug!(
-                            "workspace metadata unavailable before TUI login save: {err}"
-                        );
-                    }
-                },
-                || {
-                    let action = profile::save_auth_value(auth_val, None)?;
-                    let alias = action.alias().to_string();
-                    let verb = action.action(); // "created" / "updated"
-                    let email_disp = info.email.as_deref().unwrap_or("unknown");
-                    println!("[ok] Account {verb}: {alias} ({email_disp})");
-                    Ok(format!("Account {verb}: {alias}"))
-                },
-            )
-            .await
-        }
-        OAuthMode::Relogin(alias) => {
-            finish_refresh_then_commit(
-                async {
-                    if let Err(err) = crate::workspace::refresh_for_auth(&auth_val).await {
-                        tracing::debug!(
-                            "workspace metadata unavailable before TUI re-login save: {err}"
-                        );
-                    }
-                },
-                || {
-                    let live_replaced =
-                        profile::replace_profile_auth_and_live_if_current(&alias, &auth_val)?;
-                    let email_disp = info.email.as_deref().unwrap_or("unknown");
-                    println!("[ok] Re-logged in: {alias} ({email_disp})");
-                    if live_replaced {
-                    }
-                    Ok(format!("Re-logged in: {alias}"))
-                },
-            )
-            .await
-        }
-    }
+    let action = crate::claude_store::save_current(
+        &paths,
+        &app_home,
+        alias,
+        &crate::claude_store::LockOptions::default(),
+    )?;
+    Ok(match action {
+        crate::claude_store::SaveAction::Created(alias) => format!("Account created: {alias}"),
+        crate::claude_store::SaveAction::Updated(alias) => format!("Account updated: {alias}"),
+    })
 }
 
 fn enable_mouse_capture() {
@@ -3621,59 +3570,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn model_detail_cache_expires_without_duplicate_requests() {
-        let _home = EnvHome::new();
-        let path = crate::profile::profile_auth_path("account").unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"{}").unwrap();
-        for (previous, expected_loaded) in [
-            (ModelStatus::Loaded(vec![]), true),
-            (ModelStatus::Error("temporary failure".into()), false),
-        ] {
-            let mut app = App::new();
-            // Prevent this state-machine check from making a network request.
-            app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-            app.model_cache.insert("account".into(), previous);
-            app.model_cached_at.insert(
-                "account".into(),
-                std::time::Instant::now() - super::MODEL_CACHE_TTL,
-            );
-            app.ensure_models_loaded("account");
-            let request = app.model_requests["account"];
-            assert!(app.model_requests.contains_key("account"));
-            if expected_loaded {
-                assert!(matches!(
-                    app.model_cache.get("account"),
-                    Some(ModelStatus::Loaded(models)) if models.is_empty()
-                ));
-            } else {
-                assert!(matches!(
-                    app.model_cache.get("account"),
-                    Some(ModelStatus::Error(error)) if error == "temporary failure"
-                ));
-            }
-            app.ensure_models_loaded("account");
-            assert_eq!(app.model_requests["account"], request);
-            app.model_sender
-                .try_send((
-                    "account".into(),
-                    request,
-                    Ok(vec![ModelEntry {
-                        slug: "new-model".into(),
-                        ..ModelEntry::default()
-                    }]),
-                ))
-                .unwrap();
-            app.poll_model_results();
-            app.ensure_models_loaded("account");
-            assert!(
-                matches!(app.model_cache.get("account"), Some(ModelStatus::Loaded(models)) if models[0].slug == "new-model")
-            );
-            assert!(!app.model_requests.contains_key("account"));
-        }
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn auto_refresh_defers_until_an_account_switch_finishes() {
         let _home = EnvHome::new();
         let path = crate::profile::profile_auth_path("account").unwrap();
@@ -3732,104 +3628,6 @@ mod tests {
             deferred_deadline.saturating_duration_since(started)
                 <= std::time::Duration::from_secs(10),
             "switch deferral must use the short retry window instead of the normal interval"
-        );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn model_refresh_ignores_late_results_and_retries_after_stale_error() {
-        let _home = EnvHome::new();
-        let path = crate::profile::profile_auth_path("account").unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"{}").unwrap();
-
-        let mut app = App::new();
-        app.accounts.push(AccountEntry {
-            alias: "account".into(),
-            info: AccountInfo::default(),
-            usage: UsageStatus::Idle,
-            is_current: false,
-        });
-        app.view_indices.push(0);
-        // Any background fetch spawned by refresh/ensure must stay behind the
-        // limiter; all model responses below come from the injectable queue.
-        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-        app.ensure_models_loaded("account");
-        let old_request_id = *app
-            .model_requests
-            .get("account")
-            .expect("the initial model request must be tracked");
-
-        app.refresh_one("account");
-        let new_request_id = *app
-            .model_requests
-            .get("account")
-            .expect("a forced refresh must start a replacement model request");
-        assert_ne!(old_request_id, new_request_id);
-        app.model_sender
-            .try_send((
-                "account".into(),
-                new_request_id,
-                Ok(vec![ModelEntry {
-                    slug: "fresh-model".into(),
-                    ..ModelEntry::default()
-                }]),
-            ))
-            .unwrap();
-        app.poll_model_results();
-        app.model_sender
-            .try_send((
-                "account".into(),
-                old_request_id,
-                Ok(vec![ModelEntry {
-                    slug: "stale-model".into(),
-                    ..ModelEntry::default()
-                }]),
-            ))
-            .unwrap();
-        app.poll_model_results();
-        assert!(matches!(
-            app.model_cache.get("account"),
-            Some(ModelStatus::Loaded(models)) if models[0].slug == "fresh-model"
-        ));
-
-        app.model_cache.insert(
-            "account".into(),
-            ModelStatus::Error("stale profile response".into()),
-        );
-        // This mirrors the successful relogin path: reload account metadata,
-        // then force-refresh before asking the detail panel for models again.
-        app.load_profiles();
-        app.refresh(Refresh::Forced);
-        app.ensure_models_loaded("account");
-        let relogin_request_id = *app
-            .model_requests
-            .get("account")
-            .expect("the relogin refresh must start a new model request");
-        assert_ne!(new_request_id, relogin_request_id);
-        app.model_sender
-            .try_send((
-                "account".into(),
-                relogin_request_id,
-                Ok(vec![ModelEntry {
-                    slug: "relogin-model".into(),
-                    ..ModelEntry::default()
-                }]),
-            ))
-            .unwrap();
-        app.model_sender
-            .try_send((
-                "account".into(),
-                new_request_id,
-                Err("stale profile response".into()),
-            ))
-            .unwrap();
-        app.poll_model_results();
-        assert!(
-            matches!(
-                app.model_cache.get("account"),
-                Some(ModelStatus::Loaded(models)) if models[0].slug == "relogin-model"
-            ),
-            "a relogin force refresh must replace the old model error"
         );
     }
 

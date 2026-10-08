@@ -16,8 +16,9 @@ use crate::output::{user_print, user_println};
 
 const MAX_ALIAS_LEN: usize = 64;
 
+/// The saved Claude credentials of a profile (`credentials.json`).
 pub fn profile_auth_path(alias: &str) -> Result<PathBuf> {
-    Ok(profiles_dir()?.join(alias).join("auth.json"))
+    Ok(profiles_dir()?.join(alias).join("credentials.json"))
 }
 
 pub fn validate_alias(alias: &str) -> Result<()> {
@@ -553,15 +554,10 @@ pub fn active_profile_from_live() -> Option<String> {
     find_profile_by_identity_exact(&identity)
 }
 
+/// The profile of the live Claude account; the `current` marker is repaired
+/// to name it.
 pub fn sync_current_from_live() -> Option<String> {
-    let _transaction = lock_auth_transaction().ok()?;
-    let alias = active_profile_from_live()?;
-    if read_current() != alias
-        && let Err(e) = write_current(&alias)
-    {
-        tracing::debug!("sync_current_from_live: could not sync current pointer: {e}");
-    }
-    Some(alias)
+    crate::claude_usage::current_active()
 }
 
 // ── Deduplication ─────────────────────────────────────────
@@ -1225,25 +1221,37 @@ pub fn cmd_use(alias: &str, allow_prompt: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn switch_profile(alias: &str) -> Result<()> {
-    switch_live_auth(alias)
+/// Make `alias` the live Claude account. The app lock is held so two
+/// processes (`auto`, the TUI, a command) never swap or refresh at once.
+pub fn switch_profile(alias: &str) -> Result<crate::claude_store::SwitchOutcome> {
+    validate_alias(alias)?;
+    let paths = crate::claude_usage::paths()?;
+    let _lock = lock_live_auth()?;
+    crate::claude_store::switch_to(
+        &paths,
+        &app_home()?,
+        alias,
+        &crate::claude_store::LockOptions::default(),
+    )
 }
 
-/// Switch only if no other process changed the selected profile since the
-/// caller made its decision.
+/// Switch only if the live Claude account still belongs to `expected`, so a
+/// decision made on stale numbers never overrides a switch made by another
+/// process in the meantime.
 pub fn switch_profile_if_current(expected: &str, alias: &str) -> Result<bool> {
     validate_alias(expected)?;
     validate_alias(alias)?;
-    let src = profile_auth_path(alias)?;
-    if !src.exists() {
-        return Err(CsError::NotFound(alias.to_string()).into());
-    }
-
-    let _transaction = lock_auth_transaction()?;
-    if read_current() != expected {
+    let paths = crate::claude_usage::paths()?;
+    let _lock = lock_live_auth()?;
+    if crate::claude_usage::current_active().as_deref() != Some(expected) {
         return Ok(false);
     }
-    switch_live_auth_locked(alias, &src)?;
+    crate::claude_store::switch_to(
+        &paths,
+        &app_home()?,
+        alias,
+        &crate::claude_store::LockOptions::default(),
+    )?;
     Ok(true)
 }
 
@@ -1270,7 +1278,7 @@ pub fn cmd_delete(alias: &str) -> Result<()> {
     if !dir.exists() {
         return Err(CsError::NotFound(alias.to_string()).into());
     }
-    if read_current() == alias {
+    if crate::claude_usage::current_active().as_deref() == Some(alias) {
         return Err(CsError::ActiveProfileDelete(alias.to_string()).into());
     }
     let deleted_dir = deleted_profiles_dir()?;
@@ -1600,6 +1608,7 @@ mod tests {
         old_app_home: Option<OsString>,
         old_federation_rule_id: Option<OsString>,
         old_identity_token_file: Option<OsString>,
+        old_claude_config_dir: Option<OsString>,
     }
 
     struct ThreadCleanup<G> {
@@ -1660,8 +1669,10 @@ mod tests {
             let old_app_home = std::env::var_os("PAPER_CLAUDE_SWITCH_HOME");
             let old_federation_rule_id = std::env::var_os("OPENAI_FEDERATION_RULE_ID");
             let old_identity_token_file = std::env::var_os("OPENAI_IDENTITY_TOKEN_FILE");
+            let old_claude_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
 
             unsafe {
+                std::env::set_var("CLAUDE_CONFIG_DIR", home.path().join(".claude"));
                 std::env::set_var("HOME", home.path());
                 std::env::set_var("CODEX_HOME", &codex_home);
                 std::env::set_var("PAPER_CLAUDE_SWITCH_HOME", &app_home);
@@ -1677,6 +1688,7 @@ mod tests {
                 old_app_home,
                 old_federation_rule_id,
                 old_identity_token_file,
+                old_claude_config_dir,
             }
         }
     }
@@ -1696,6 +1708,10 @@ mod tests {
                     Some(value) => std::env::set_var("PAPER_CLAUDE_SWITCH_HOME", value),
                     None => std::env::remove_var("PAPER_CLAUDE_SWITCH_HOME"),
                 }
+                match &self.old_claude_config_dir {
+                    Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+                }
                 match &self.old_federation_rule_id {
                     Some(value) => std::env::set_var("OPENAI_FEDERATION_RULE_ID", value),
                     None => std::env::remove_var("OPENAI_FEDERATION_RULE_ID"),
@@ -1706,6 +1722,56 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn write_json_file(path: &std::path::Path, value: serde_json::Value) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    }
+
+    fn claude_oauth(token: &str) -> serde_json::Value {
+        serde_json::json!({
+            "accessToken": token,
+            "refreshToken": format!("refresh-{token}"),
+            "expiresAt": 4_102_444_800_000_i64,
+        })
+    }
+
+    fn claude_account(alias: &str) -> serde_json::Value {
+        serde_json::json!({
+            "accountUuid": format!("U-{alias}"),
+            "emailAddress": format!("{alias}@example.com"),
+        })
+    }
+
+    /// A saved Claude profile for account `U-<alias>`.
+    fn seed_claude_profile(alias: &str, token: &str) {
+        let dir = super::profiles_dir().unwrap().join(alias);
+        write_json_file(
+            &dir.join("credentials.json"),
+            serde_json::json!({"claudeAiOauth": claude_oauth(token)}),
+        );
+        write_json_file(&dir.join("account.json"), claude_account(alias));
+    }
+
+    /// Claude Code logged in as account `U-<alias>`.
+    fn write_live_claude(alias: &str, token: &str) {
+        let paths = crate::claude_usage::paths().unwrap();
+        write_json_file(
+            &paths.credentials,
+            serde_json::json!({"claudeAiOauth": claude_oauth(token)}),
+        );
+        write_json_file(
+            &paths.global_config,
+            serde_json::json!({"oauthAccount": claude_account(alias)}),
+        );
+    }
+
+    fn live_claude_token() -> String {
+        let live = crate::claude_store::read_live(&crate::claude_usage::paths().unwrap())
+            .unwrap()
+            .unwrap();
+        live.oauth["accessToken"].as_str().unwrap().to_owned()
     }
 
     fn assert_invalid_alias(result: Result<()>, expected_message: &str) {
@@ -1744,7 +1810,7 @@ mod tests {
                 "alias may only contain ASCII letters, digits, '_', '-', '.'",
             );
             assert_invalid_alias(
-                switch_profile(alias),
+                switch_profile(alias).map(|_| ()),
                 "alias may only contain ASCII letters, digits, '_', '-', '.'",
             );
             assert_invalid_alias(
@@ -1758,7 +1824,7 @@ mod tests {
         }
 
         assert_invalid_alias(cmd_use("", true), "alias cannot be empty");
-        assert_invalid_alias(switch_profile(""), "alias cannot be empty");
+        assert_invalid_alias(switch_profile("").map(|_| ()), "alias cannot be empty");
         assert_invalid_alias(cmd_delete(""), "alias cannot be empty");
         assert_invalid_alias(rename_profile("", "valid-alias"), "alias cannot be empty");
     }
@@ -1777,69 +1843,6 @@ mod tests {
         }
 
         assert_invalid_alias(rename_profile("valid-alias", ""), "alias cannot be empty");
-    }
-
-    #[test]
-    fn switching_account_resets_provider_selection_and_preserves_other_config() {
-        let _env = TestEnv::new();
-        let live = crate::auth::codex_auth_path().unwrap();
-        let next = realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new");
-        let saved = super::profile_auth_path("next").unwrap();
-        super::ensure_profile_parent(&saved).unwrap();
-        crate::auth::write_auth(&saved, &next).unwrap();
-        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
-        let path = live.with_file_name("config.toml");
-        let original = concat!(
-            "# 用户配置\r\n",
-            "model_provider = 'gateway' # 当前路由\r\n",
-            "model = 'gpt-5.4'\r\n",
-            "profile = 'daily'\r\n",
-            "[profiles.daily]\r\n",
-            "model_provider = \"gateway\"\r\n",
-            "model_reasoning_effort = 'high'\r\n",
-            "[profiles.other]\r\n",
-            "model_provider = 'other-gateway'\r\n",
-            "[model_providers.gateway]\r\n",
-            "name = 'Gateway'\r\n",
-            "base_url = 'https://gateway.example/v1'\r\n",
-            "[mcp_servers.demo]\r\n",
-            "command = 'demo'\r\n",
-        );
-        std::fs::write(&path, original).unwrap();
-
-        switch_profile("next").unwrap();
-
-        let expected = original
-            .replace("model_provider = 'gateway'", "model_provider = \"openai\"")
-            .replace(
-                "model_provider = \"gateway\"",
-                "model_provider = \"openai\"",
-            );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
-        assert_eq!(crate::auth::read_auth(&live).unwrap(), next);
-        assert_eq!(super::read_current(), "next");
-    }
-
-    #[test]
-    fn profile_layer_refuses_live_switch_when_federated_identity_is_present() {
-        let _env = TestEnv::new();
-        let first = realistic_auth_json("first@example.com", "acct_first", "a1", "r1");
-        let second = realistic_auth_json("second@example.com", "acct_second", "a2", "r2");
-        for (alias, value) in [("first", first), ("second", second)] {
-            let path = super::profile_auth_path(alias).unwrap();
-            super::ensure_profile_parent(&path).unwrap();
-            crate::auth::write_auth(&path, &value).unwrap();
-        }
-        super::switch_profile("first").unwrap();
-        let live_path = crate::auth::codex_auth_path_unchecked().unwrap();
-        let before = crate::auth::read_auth(&live_path).unwrap();
-        unsafe { std::env::set_var("OPENAI_IDENTITY_TOKEN_FILE", "") };
-
-        let error = super::switch_profile("second").unwrap_err();
-
-        assert!(error.to_string().contains("OPENAI_IDENTITY_TOKEN_FILE"));
-        assert_eq!(super::read_current(), "first");
-        assert_eq!(crate::auth::read_auth(&live_path).unwrap(), before);
     }
 
     #[test]
@@ -1919,43 +1922,12 @@ mod tests {
     }
 
     #[test]
-    fn switching_account_keeps_default_openai_config_unchanged() {
-        let _env = TestEnv::new();
-        let live = crate::auth::codex_auth_path().unwrap();
-        let saved = super::profile_auth_path("next").unwrap();
-        super::ensure_profile_parent(&saved).unwrap();
-        crate::auth::write_auth(
-            &saved,
-            &realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new"),
-        )
-        .unwrap();
-        switch_profile("next").unwrap();
-        let path = live.with_file_name("config.toml");
-        assert!(!path.exists(), "default routing needs no config file");
-
-        for original in [
-            "# 官方默认\nmodel = 'gpt-5.4'\n",
-            "model_provider = 'openai' # 官方\nmodel = 'gpt-5.4'\n",
-        ] {
-            std::fs::write(&path, original).unwrap();
-            switch_profile("next").unwrap();
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        }
-    }
-
-    #[test]
     fn switch_profile_waits_for_auth_lock() {
         let _env = TestEnv::new();
 
-        let live = crate::auth::codex_auth_path().unwrap();
-        let current =
-            realistic_auth_json("current@example.com", "acct_current", "acc_old", "ref_old");
-        crate::auth::write_auth(&live, &current).unwrap();
-
-        let next = realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new");
-        let profile_path = super::profile_auth_path("next-profile").unwrap();
-        super::ensure_profile_parent(&profile_path).unwrap();
-        crate::auth::write_auth(&profile_path, &next).unwrap();
+        seed_claude_profile("current", "acc_old");
+        write_live_claude("current", "acc_old");
+        seed_claude_profile("next-profile", "acc_new");
 
         let lock_path = super::auth_lock_path().unwrap();
         let lock_file = std::fs::OpenOptions::new()
@@ -1986,13 +1958,7 @@ mod tests {
             ),
             "switch should block while auth lock is held"
         );
-        assert_eq!(
-            crate::auth::read_auth(&live)
-                .unwrap()
-                .pointer("/tokens/access_token")
-                .and_then(|v| v.as_str()),
-            Some("acc_old")
-        );
+        assert_eq!(live_claude_token(), "acc_old");
 
         cleanup.release_blocker();
 
@@ -2001,33 +1967,16 @@ mod tests {
             .expect("switch did not finish after auth lock release")
             .unwrap();
         cleanup.join_all();
-        assert_eq!(
-            crate::auth::read_auth(&live)
-                .unwrap()
-                .pointer("/tokens/access_token")
-                .and_then(|v| v.as_str()),
-            Some("acc_new")
-        );
+        assert_eq!(live_claude_token(), "acc_new");
         assert_eq!(super::read_current(), "next-profile");
     }
 
     #[test]
     fn conditional_switch_preserves_a_newer_manual_selection() {
         let _env = TestEnv::new();
-        for (alias, access, refresh) in [
-            ("alpha", "access-a", "refresh-a"),
-            ("beta", "access-b", "refresh-b"),
-            ("charlie", "access-c", "refresh-c"),
-        ] {
-            let auth = realistic_auth_json(
-                &format!("{alias}@example.com"),
-                &format!("acct-{alias}"),
-                access,
-                refresh,
-            );
-            let path = super::profile_auth_path(alias).unwrap();
-            super::ensure_profile_parent(&path).unwrap();
-            crate::auth::write_auth(&path, &auth).unwrap();
+        for (alias, access) in [("alpha", "access-a"), ("beta", "access-b"), ("charlie", "access-c")]
+        {
+            seed_claude_profile(alias, access);
         }
 
         switch_profile("alpha").unwrap();
@@ -2035,13 +1984,9 @@ mod tests {
 
         assert!(!switch_profile_if_current("alpha", "beta").unwrap());
         assert_eq!(super::read_current(), "charlie");
-        assert_eq!(
-            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap())
-                .unwrap()
-                .pointer("/tokens/access_token")
-                .and_then(|value| value.as_str()),
-            Some("access-c")
-        );
+        assert_eq!(live_claude_token(), "access-c");
+        assert!(switch_profile_if_current("charlie", "beta").unwrap());
+        assert_eq!(live_claude_token(), "access-b");
     }
 
     #[test]
@@ -2071,207 +2016,14 @@ mod tests {
     }
 
     #[test]
-    fn switch_profile_waits_for_launch_session_lease() {
-        let _env = TestEnv::new();
-        let next = realistic_auth_json("next@example.com", "acct_next", "acc_new", "ref_new");
-        let profile_path = super::profile_auth_path("next-profile").unwrap();
-        super::ensure_profile_parent(&profile_path).unwrap();
-        crate::auth::write_auth(&profile_path, &next).unwrap();
-
-        let lease = super::lock_launch_session().unwrap();
-        let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            super::notify_on_test_lock_attempt("launch session", attempt_tx);
-            let _ = done_tx.send(super::switch_profile("next-profile"));
-        });
-        let mut cleanup = ThreadCleanup::new(lease);
-        cleanup.push(handle);
-
-        attempt_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("switch did not reach launch session lock attempt");
-        assert!(
-            matches!(
-                done_rx.try_recv(),
-                Err(std::sync::mpsc::TryRecvError::Empty)
-            ),
-            "switch must wait while the launch session lease is held"
-        );
-
-        cleanup.release_blocker();
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("switch did not finish after launch session lease release")
-            .unwrap();
-        cleanup.join_all();
-    }
-
-    #[test]
-    fn refreshed_profile_and_live_auth_update_are_one_transaction() {
-        let _env = TestEnv::new();
-        let alice = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
-        let bob = realistic_auth_json("bob@example.com", "acct_b", "b-old", "b-ref");
-        let alice_path = super::profile_auth_path("alice").unwrap();
-        let bob_path = super::profile_auth_path("bob").unwrap();
-        super::ensure_profile_parent(&alice_path).unwrap();
-        super::ensure_profile_parent(&bob_path).unwrap();
-        crate::auth::write_auth(&alice_path, &alice).unwrap();
-        crate::auth::write_auth(&bob_path, &bob).unwrap();
-        super::switch_profile("alice").unwrap();
-
-        let auth_gate = super::lock_live_auth().unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let updater = std::thread::spawn(move || {
-            let result = super::update_profile_tokens_if_refresh_matches_after_launch(
-                "alice",
-                "a-ref",
-                "a-id-new",
-                "a-new",
-                "a-ref-new",
-                || {
-                    let _ = started_tx.send(());
-                },
-            );
-            let _ = done_tx.send(result);
-        });
-        let mut cleanup = ThreadCleanup::new(auth_gate);
-        cleanup.push(updater);
-        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-
-        let (switch_tx, switch_rx) = std::sync::mpsc::channel();
-        let switcher = std::thread::spawn(move || {
-            let _ = switch_tx.send(super::switch_profile("bob"));
-        });
-        cleanup.push(switcher);
-        cleanup.release_blocker();
-        done_rx
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap()
-            .then_some(())
-            .expect("refresh CAS should persist");
-        switch_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("profile switch did not finish after refresh transaction")
-            .unwrap();
-        cleanup.join_all();
-
-        assert_eq!(super::read_current(), "bob");
-        let live = crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap();
-        assert_eq!(
-            live.pointer("/tokens/access_token")
-                .and_then(|v| v.as_str()),
-            Some("b-old")
-        );
-        let alice_updated = crate::auth::read_auth(&alice_path).unwrap();
-        assert_eq!(
-            alice_updated
-                .pointer("/tokens/access_token")
-                .and_then(|v| v.as_str()),
-            Some("a-new")
-        );
-    }
-
-    #[test]
-    fn rotated_profile_credentials_survive_policy_change_before_live_auth_update() {
-        let env = TestEnv::new();
-        let original = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
-        let path = super::profile_auth_path("alice").unwrap();
-        super::ensure_profile_parent(&path).unwrap();
-        crate::auth::write_auth(&path, &original).unwrap();
-        super::switch_profile("alice").unwrap();
-        let live_path = crate::auth::codex_auth_path().unwrap();
-
-        // Simulate enterprise policy changing while the refresh request is in
-        // flight. The already-rotated token must still reach its profile, while
-        // the newly forbidden file-backed live auth is left untouched.
-        let codex_home = env._home.path().join(".codex");
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "cli_auth_credentials_store = 'keyring'\n",
-        )
-        .unwrap();
-
-        assert!(
-            super::update_profile_tokens_if_refresh_matches(
-                "alice",
-                "a-ref",
-                &make_jwt("alice@example.com", "acct_a"),
-                "a-new",
-                "a-ref-new"
-            )
-            .unwrap()
-        );
-
-        let saved = crate::auth::read_auth(&path).unwrap();
-        assert_eq!(
-            crate::auth::extract_tokens(&saved).1.as_deref(),
-            Some("a-ref-new")
-        );
-        let live = crate::auth::read_auth(&live_path).unwrap();
-        assert_eq!(
-            crate::auth::extract_tokens(&live).1.as_deref(),
-            Some("a-ref")
-        );
-    }
-
-    #[test]
-    fn rotated_profile_credentials_survive_new_workspace_restriction() {
-        let env = TestEnv::new();
-        let original = realistic_auth_json("alice@example.com", "acct_a", "a-old", "a-ref");
-        let path = super::profile_auth_path("alice").unwrap();
-        super::ensure_profile_parent(&path).unwrap();
-        crate::auth::write_auth(&path, &original).unwrap();
-        super::switch_profile("alice").unwrap();
-        let live_path = crate::auth::codex_auth_path().unwrap();
-
-        std::fs::write(
-            env._home.path().join(".codex/config.toml"),
-            "forced_chatgpt_workspace_id = 'acct_other'\n",
-        )
-        .unwrap();
-
-        assert!(
-            super::update_profile_tokens_if_refresh_matches(
-                "alice",
-                "a-ref",
-                &make_jwt("alice@example.com", "acct_a"),
-                "a-new",
-                "a-ref-new",
-            )
-            .unwrap()
-        );
-        let saved = crate::auth::read_auth(&path).unwrap();
-        assert_eq!(
-            crate::auth::extract_tokens(&saved).1.as_deref(),
-            Some("a-ref-new")
-        );
-        let live = crate::auth::read_auth(&live_path).unwrap();
-        assert_eq!(
-            crate::auth::extract_tokens(&live).1.as_deref(),
-            Some("a-ref")
-        );
-    }
-
-    #[test]
     fn sync_current_from_live_matches_live_identity() {
         let _env = TestEnv::new();
 
-        let alpha = realistic_auth_json("alpha@example.com", "acct_alpha", "acc_a", "ref_a");
-        let alpha_path = super::profile_auth_path("alpha").unwrap();
-        super::ensure_profile_parent(&alpha_path).unwrap();
-        crate::auth::write_auth(&alpha_path, &alpha).unwrap();
-
-        let beta = realistic_auth_json("beta@example.com", "acct_beta", "acc_b_old", "ref_b_old");
-        let beta_path = super::profile_auth_path("beta").unwrap();
-        super::ensure_profile_parent(&beta_path).unwrap();
-        crate::auth::write_auth(&beta_path, &beta).unwrap();
+        seed_claude_profile("alpha", "acc_a");
+        seed_claude_profile("beta", "acc_b_old");
 
         super::write_current("alpha").unwrap();
-        let live = realistic_auth_json("beta@example.com", "acct_beta", "acc_b_new", "ref_b_new");
-        crate::auth::write_auth(&crate::auth::codex_auth_path().unwrap(), &live).unwrap();
+        write_live_claude("beta", "acc_b_new");
 
         assert_eq!(super::sync_current_from_live().as_deref(), Some("beta"));
         assert_eq!(super::read_current(), "beta");
@@ -3229,40 +2981,6 @@ mod tests {
     }
 
     #[test]
-    fn switch_rejects_disallowed_managed_workspace_without_changing_live_auth() {
-        let env = TestEnv::new();
-        seed_profile(
-            "blocked",
-            &realistic_auth_json(
-                "blocked@example.com",
-                "workspace-blocked",
-                "blocked_access",
-                "blocked_refresh",
-            ),
-        );
-        let original = realistic_auth_json(
-            "allowed@example.com",
-            "workspace-allowed",
-            "live_access",
-            "live_refresh",
-        );
-        write_live(&original);
-        std::fs::create_dir_all(env._home.path().join(".codex")).unwrap();
-        std::fs::write(
-            env._home.path().join(".codex/config.toml"),
-            "forced_chatgpt_workspace_id = \"workspace-allowed\"\n",
-        )
-        .unwrap();
-
-        let err = super::switch_profile("blocked").expect_err("managed policy must fail closed");
-        assert!(err.to_string().contains("not allowed"));
-        assert_eq!(
-            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
-            original
-        );
-    }
-
-    #[test]
     fn save_rejects_disallowed_managed_workspace_before_creating_profile() {
         let env = TestEnv::new();
         let blocked = realistic_auth_json(
@@ -3321,44 +3039,6 @@ mod tests {
         let inferred = cmd_save(None).expect_err("the inferred target must not skip the guard");
         assert_rollback_refusal(&inferred);
         assert_eq!(profile_refresh_token("alice"), "ref_new");
-    }
-
-    #[test]
-    fn stale_active_profile_guidance_offers_working_recovery_commands() {
-        let _env = TestEnv::new();
-        seed_profile_ahead_of_live();
-        super::write_current("alice").unwrap();
-        let error = super::update_profile_from_live("alice").unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("paper-claude-switch use alice"), "{message}");
-        assert!(message.contains("paper-claude-switch login alice"), "{message}");
-        assert!(!message.contains("paper-claude-switch delete"), "{message}");
-        assert!(super::cmd_delete("alice").is_err());
-
-        // The suggested use path can recover the active profile without deleting it.
-        super::switch_profile("alice").unwrap();
-        assert!(matches!(
-            super::detect_auth_change(),
-            super::AuthChange::NoChange
-        ));
-        assert_eq!(profile_refresh_token("alice"), "ref_new");
-
-        // Re-login also replaces an active profile even when timestamps cannot be ordered.
-        seed_profile_ahead_of_live();
-        let fresh = stamped_auth_json(
-            "alice@example.com",
-            "acct_a",
-            "acc_login",
-            "ref_login",
-            None,
-        );
-        assert!(super::replace_profile_auth_and_live_if_current("alice", &fresh).unwrap());
-        assert_eq!(profile_refresh_token("alice"), "ref_login");
-        assert_eq!(
-            crate::auth::read_auth(&crate::auth::codex_auth_path().unwrap()).unwrap(),
-            fresh
-        );
-        assert_eq!(super::read_current(), "alice");
     }
 
     #[test]

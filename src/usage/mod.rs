@@ -1,3 +1,6 @@
+// The Codex usage/refresh code below is dead until the next task removes it.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

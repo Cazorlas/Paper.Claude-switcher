@@ -330,33 +330,25 @@ pub(super) fn extract_error_summary(err: &str) -> String {
     }
 }
 
-/// High-level: fetch usage with retry, token refresh, and disk cache.
-pub async fn fetch_usage_retried(
-    alias: &str,
-    profile_path: &Path,
-    current_alias: &str,
-) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Cached).await
+/// Claude usage for a saved profile, served from the usage cache when fresh.
+/// The active account is read with its live token and never refreshed here.
+pub async fn fetch_usage_retried(alias: &str) -> std::result::Result<UsageInfo, UsageError> {
+    crate::claude_usage::fetch_alias(alias, false).await
 }
 
-/// Bypass the usage TTL for current numbers, but leave a recorded auth verdict
-/// standing. Used by background refreshes and one-time warmup operations.
+/// Bypass the usage TTL for current numbers. Used by background refreshes.
 pub async fn fetch_usage_retried_unattended(
     alias: &str,
-    profile_path: &Path,
-    current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Unattended).await
+    crate::claude_usage::fetch_alias(alias, true).await
 }
 
-/// Bypass every cache, including a recorded auth verdict. Only for a person
-/// explicitly asking again — see [`Refresh::Forced`].
+/// Bypass every cache. For a person explicitly asking again, or a decision
+/// that must not run on stale numbers.
 pub async fn fetch_usage_retried_force(
     alias: &str,
-    profile_path: &Path,
-    current_alias: &str,
 ) -> std::result::Result<UsageInfo, UsageError> {
-    fetch_usage_retried_inner(alias, profile_path, current_alias, Refresh::Forced).await
+    crate::claude_usage::fetch_alias(alias, true).await
 }
 
 /// Write credentials the auth server just rotated back to the profile.

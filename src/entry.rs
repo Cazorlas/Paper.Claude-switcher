@@ -168,7 +168,16 @@ async fn dispatch(
     let command = command_name(&cmd);
     let started = std::time::Instant::now();
     tracing::debug!(command, "command started");
-    // Offer to save an unsaved live Claude account — skip for commands that manage it themselves
+    // First run in JSON mode (nobody to prompt): the live Claude login becomes
+    // the first profile. Without --json it is offered or announced below.
+    if json
+        && matches!(
+            &cmd,
+            Commands::List { .. } | Commands::Use { .. } | Commands::Auto { .. } | Commands::Tui
+        )
+    {
+        save_first_live_account();
+    }
     if !json
         && !matches!(
             &cmd,
@@ -218,19 +227,9 @@ async fn dispatch(
             dev,
             stable,
         } => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
-        Commands::Launch {
-            alias,
-            model,
-            args,
-        } => {
+        Commands::Launch { alias, args, .. } => {
             let args = merge_launch_args(args, launch_passthrough);
-            commands::launch_cmd(
-                alias.as_deref(),
-                args,
-                json,
-                    model.as_deref(),
-                )
-            .await?
+            commands::launch_cmd(alias.as_deref(), args, json).await?
         }
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => commands::open_cmd()?,
@@ -247,6 +246,27 @@ async fn dispatch(
 }
 
 // ── startup auth change detection ────────────────────────
+
+/// No profile exists yet and Claude Code has a live login: save it without
+/// asking. The notice goes to stderr so `--json` stdout stays pure JSON.
+fn save_first_live_account() {
+    let Ok(paths) = claude_usage::paths() else { return };
+    if !matches!(claude_store::read_live(&paths), Ok(Some(_))) {
+        return;
+    }
+    if !matches!(crate::profile::list_profiles(), Ok(profiles) if profiles.is_empty()) {
+        return;
+    }
+    let saved = auth::app_home().and_then(|home| {
+        claude_store::save_current(&paths, &home, None, &claude_store::LockOptions::default())
+    });
+    match saved {
+        Ok(claude_store::SaveAction::Created(alias) | claude_store::SaveAction::Updated(alias)) => {
+            eprintln!("{}", color::success(&format!("Saved profile: {alias}")));
+        }
+        Err(e) => eprintln!("{}", color::error(&format!("Failed to save: {e:#}"))),
+    }
+}
 
 /// Claude Code is logged in to an account that has no saved profile: say so,
 /// and offer to save it when a person is at the keyboard.

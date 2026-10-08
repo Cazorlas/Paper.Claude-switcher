@@ -50,12 +50,7 @@ impl Accounts {
                 );
             }
         }
-        let outcome = claude_store::switch_to(
-            &self.paths,
-            &auth::app_home()?,
-            alias,
-            &LockOptions::default(),
-        )?;
+        let outcome = profile::switch_profile(alias)?;
         cache::set_last_used(alias)?;
         tracing::info!(
             action = "switch",
@@ -247,11 +242,12 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     profile::validate_alias(alias)?;
-    if profile::read_current() == alias {
-        anyhow::bail!("cannot delete the active profile '{alias}'");
-    }
     if !profile::profile_auth_path(alias)?.exists() {
         anyhow::bail!("profile '{alias}' not found");
+    }
+    // The live account decides, whatever the `current` marker says.
+    if claude_usage::current_active().as_deref() == Some(alias) {
+        anyhow::bail!("cannot delete the active profile '{alias}'");
     }
 
     if !yes {
@@ -314,8 +310,8 @@ pub(crate) fn score_profile_candidates(
     let items = fetched
         .into_iter()
         .map(|(alias, u)| {
-            let info = profile::profile_auth_path(&alias)
-                .map(|p| auth::read_account_info(&p))
+            let info = claude_usage::read_profile(&alias)
+                .map(|p| p.info)
                 .unwrap_or_default();
             let last_used = cache::get_last_used(&alias);
             (alias, u, info, last_used)
@@ -324,90 +320,14 @@ pub(crate) fn score_profile_candidates(
     rank_candidates(items, now, safety_7d, team_priority)
 }
 
-pub(crate) async fn select_best_profile(
-    json: bool,
-) -> Result<SelectOutcome> {
-    let profiles = profile::list_profiles()?;
-    if profiles.is_empty() {
-        anyhow::bail!(
-            "no saved profiles; run `paper-claude-switch login` first"
-        );
-    }
+/// Make `alias` the live Claude account (what `use <alias>` does).
+pub(crate) fn switch_alias(alias: &str) -> Result<SwitchOutcome> {
+    Accounts::load()?.switch(alias)
+}
 
-    let current = profile::read_current();
-    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(
-        config::get().network.max_concurrent,
-    ));
-
-    let mut tasks = tokio::task::JoinSet::new();
-    let mut fetched: Vec<(String, usage::UsageInfo)> = Vec::with_capacity(profiles.len());
-
-    for alias in profiles {
-        if let Some(cached) = cache::get_async(&alias).await {
-            fetched.push((alias, cached));
-            continue;
-        }
-
-        let current = current.clone();
-        let sem = semaphore.clone();
-        tasks.spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return None;
-            };
-            let path = match profile::profile_auth_path(&alias) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!("[{alias}] failed to resolve profile path: {e}");
-                    return None;
-                }
-            };
-            match usage::fetch_usage_retried(&alias, &path, &current).await {
-                Ok(u) => Some((alias, u)),
-                Err(e) => {
-                    tracing::warn!("[{alias}] usage fetch failed during auto-select: {e}");
-                    None
-                }
-            }
-        });
-    }
-
-    let mut progress = if json {
-        None
-    } else {
-        Some(ProgressReporter::new("Testing accounts", tasks.len()))
-    };
-
-    let mut completed = 0usize;
-    while let Some(task) = tasks.join_next().await {
-        completed += 1;
-        if let Some(progress) = progress.as_mut() {
-            progress.advance(completed);
-        }
-        if let Some((alias, usage)) =
-            task.map_err(|e| anyhow::anyhow!("usage worker failed: {e}"))?
-        {
-            fetched.push((alias, usage));
-        }
-    }
-
-    if let Some(progress) = progress.as_mut() {
-        progress.finish();
-    }
-
-    if fetched.is_empty() {
-        anyhow::bail!("all usage queries failed");
-    }
-
-    let safety_7d = config::get().use_cfg.safety_margin_7d;
-    let team_priority = config::get().use_cfg.team_priority;
-    let now = auth::now_unix_secs();
-    let scored = score_profile_candidates(fetched, now, safety_7d, team_priority);
-    let (top_candidate, top_usage, top_score) = scored
-        .first()
-        .map(|(c, u, s)| (c.clone(), u.clone(), *s))
-        .context("failed to select best profile")?;
-
-    Ok(SelectOutcome { alias: top_candidate.alias, usage: top_usage, score: top_score })
+/// The best profile to use now, by usage; nothing is switched here.
+pub(crate) async fn select_best_profile(json: bool) -> Result<SelectOutcome> {
+    rank_accounts(&Accounts::load()?, json).await
 }
 
 pub(crate) struct SelectOutcome {
@@ -416,8 +336,7 @@ pub(crate) struct SelectOutcome {
     pub(crate) score: f64,
 }
 
-async fn best_cmd(json: bool) -> Result<()> {
-    let accounts = Accounts::load()?;
+async fn rank_accounts(accounts: &Accounts, json: bool) -> Result<SelectOutcome> {
     if accounts.profiles.is_empty() {
         anyhow::bail!("no saved profiles; run `paper-claude-switch login` first");
     }
@@ -468,7 +387,13 @@ async fn best_cmd(json: bool) -> Result<()> {
         .into_iter()
         .next()
         .context("failed to select best profile")?;
-    let best_alias = top.alias;
+    Ok(SelectOutcome { alias: top.alias, usage: best_usage, score: best_score })
+}
+
+async fn best_cmd(json: bool) -> Result<()> {
+    let accounts = Accounts::load()?;
+    let SelectOutcome { alias: best_alias, usage: best_usage, score: best_score } =
+        rank_accounts(&accounts, json).await?;
 
     accounts.switch(&best_alias)?;
     let info = accounts

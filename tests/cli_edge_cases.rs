@@ -23,35 +23,6 @@ fn temp_home(name: &str) -> PathBuf {
     path
 }
 
-fn jwt(payload: &Value) -> String {
-    let json = serde_json::to_vec(payload).unwrap();
-    let encoded = {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        URL_SAFE_NO_PAD.encode(json)
-    };
-    format!("x.{encoded}.y")
-}
-
-fn auth_json(email: &str, account_id: &str) -> Value {
-    let claims = serde_json::json!({
-        "email": email,
-        "https://api.openai.com/auth": {
-            "chatgpt_plan_type": "plus",
-            "chatgpt_account_id": account_id,
-            "chatgpt_user_id": format!("user_{account_id}"),
-            "organizations": [],
-        }
-    });
-
-    serde_json::json!({
-        "tokens": {
-            "id_token": jwt(&claims),
-            "refresh_token": "dummy-refresh",
-            "account_id": account_id,
-        }
-    })
-}
-
 fn write_json(path: impl AsRef<Path>, value: &Value) {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
@@ -441,10 +412,7 @@ fn dangling_config_symlink_fails_instead_of_using_defaults() {
 #[test]
 fn json_delete_requires_explicit_yes_and_preserves_profile() {
     let home = temp_home("delete-json-confirm");
-    write_json(
-        home.join(".paper-claude-switch/profiles/gina/auth.json"),
-        &auth_json("gina@example.com", "acct_gina"),
-    );
+    write_claude_profile(&home, "gina", "gina@example.com", "U-gina", "tok-gina");
 
     let output = run(&home, &["--json", "delete", "gina"]);
     assert!(!output.status.success());
@@ -455,7 +423,7 @@ fn json_delete_requires_explicit_yes_and_preserves_profile() {
             "error": "confirmation required; rerun with --yes to delete profile 'gina'"
         })
     );
-    assert!(home.join(".paper-claude-switch/profiles/gina/auth.json").exists());
+    assert!(home.join(".paper-claude-switch/profiles/gina/credentials.json").exists());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -463,10 +431,7 @@ fn json_delete_requires_explicit_yes_and_preserves_profile() {
 #[test]
 fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
     let home = temp_home("delete-non-interactive-confirm");
-    write_json(
-        home.join(".paper-claude-switch/profiles/gina/auth.json"),
-        &auth_json("gina@example.com", "acct_gina"),
-    );
+    write_claude_profile(&home, "gina", "gina@example.com", "U-gina", "tok-gina");
 
     let mut cmd = command(&home, &["delete", "gina"]);
     cmd.stdin(Stdio::null());
@@ -476,7 +441,7 @@ fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
         String::from_utf8_lossy(&output.stderr)
             .contains("confirmation required; rerun with --yes to delete profile 'gina'")
     );
-    assert!(home.join(".paper-claude-switch/profiles/gina/auth.json").exists());
+    assert!(home.join(".paper-claude-switch/profiles/gina/credentials.json").exists());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -484,10 +449,7 @@ fn non_interactive_delete_requires_explicit_yes_and_preserves_profile() {
 #[test]
 fn delete_with_yes_archives_inactive_profile_for_recovery() {
     let home = temp_home("delete-yes");
-    write_json(
-        home.join(".paper-claude-switch/profiles/gina/auth.json"),
-        &auth_json("gina@example.com", "acct_gina"),
-    );
+    write_claude_profile(&home, "gina", "gina@example.com", "U-gina", "tok-gina");
 
     let output = run(&home, &["--json", "delete", "gina", "--yes"]);
     assert!(output.status.success());
@@ -509,7 +471,7 @@ fn delete_with_yes_archives_inactive_profile_for_recovery() {
             .to_string_lossy()
             .starts_with("gina.backup-")
     );
-    assert!(archived[0].join("auth.json").exists());
+    assert!(archived[0].join("credentials.json").exists());
 
     let _ = fs::remove_dir_all(home);
 }
@@ -517,17 +479,15 @@ fn delete_with_yes_archives_inactive_profile_for_recovery() {
 #[test]
 fn delete_rejects_active_profile() {
     let home = temp_home("delete-active");
-    write_json(
-        home.join(".paper-claude-switch/profiles/gina/auth.json"),
-        &auth_json("gina@example.com", "acct_gina"),
-    );
+    write_claude_profile(&home, "gina", "gina@example.com", "U-gina", "tok-gina");
+    write_live_login(&home, "gina@example.com", "U-gina", "tok-gina");
     fs::create_dir_all(home.join(".paper-claude-switch")).unwrap();
     fs::write(home.join(".paper-claude-switch/current"), "gina").unwrap();
 
     let output = run(&home, &["delete", "gina", "--yes"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot delete the active profile"));
-    assert!(home.join(".paper-claude-switch/profiles/gina/auth.json").exists());
+    assert!(home.join(".paper-claude-switch/profiles/gina/credentials.json").exists());
     assert_eq!(
         fs::read_to_string(home.join(".paper-claude-switch/current")).unwrap(),
         "gina"
@@ -673,12 +633,10 @@ fn list_progress_counts_only_stale_accounts() {
 #[test]
 fn deleted_profile_can_be_listed_and_restored() {
     let home = temp_home("restore");
-    for (alias, id) in [("alice", "acct_a"), ("bob", "acct_b")] {
-        write_json(
-            home.join(format!(".paper-claude-switch/profiles/{alias}/auth.json")),
-            &auth_json(&format!("{alias}@example.com"), id),
-        );
+    for (alias, id) in [("alice", "U-a"), ("bob", "U-b")] {
+        write_claude_profile(&home, alias, &format!("{alias}@example.com"), id, alias);
     }
+    write_live_login(&home, "alice@example.com", "U-a", "alice");
     fs::write(home.join(".paper-claude-switch/current"), "alice").unwrap();
 
     let output = run(&home, &["delete", "bob", "--yes"]);
@@ -693,7 +651,7 @@ fn deleted_profile_can_be_listed_and_restored() {
 
     let output = run(&home, &["--json", "restore", "bob"]);
     assert!(output.status.success(), "{output:?}");
-    assert!(home.join(".paper-claude-switch/profiles/bob/auth.json").exists());
+    assert!(home.join(".paper-claude-switch/profiles/bob/credentials.json").exists());
 
     let output = run(&home, &["--json", "restore", "bob"]);
     assert!(!output.status.success(), "no archive is left to restore");
