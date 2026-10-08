@@ -47,6 +47,12 @@ struct CacheEntry {
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
     #[serde(default)]
     session_reset: Option<crate::claude_api::SessionReset>,
+    /// When the usage endpoint last answered for this alias. The status line
+    /// refreshes `ts` without it, so this tells when the rest of the reading
+    /// (session reset, per-model windows) needs the endpoint again.
+    /// Absent in caches written before it existed: then `ts` stands in.
+    #[serde(default)]
+    api_ts: Option<u64>,
 }
 
 /// Last answer of the profile endpoint for one alias.
@@ -190,6 +196,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         individual_limit: u.individual_limit.clone(),
         additional_limits: u.additional_limits.clone(),
         session_reset: u.session_reset.clone(),
+        api_ts: None,
     }
 }
 
@@ -256,7 +263,10 @@ pub fn get(alias: &str) -> Option<UsageInfo> {
         let Some(entry) = cache.entries.get(alias) else {
             return Ok(None);
         };
-        if now_secs().saturating_sub(entry.ts) > ttl() {
+        let now = now_secs();
+        if now.saturating_sub(entry.ts) > ttl()
+            || now.saturating_sub(entry.api_ts.unwrap_or(entry.ts)) > ttl().max(ENDPOINT_REFRESH_SECS)
+        {
             return Ok(None);
         }
         Ok(usage_of(&cache, alias))
@@ -284,7 +294,9 @@ pub fn last_good(alias: &str) -> Option<UsageInfo> {
 pub fn put(alias: &str, usage: &UsageInfo) {
     if let Err(err) = with_cache_lock(|| {
         let mut cache = load_cache();
-        cache.entries.insert(alias.to_string(), to_entry(usage));
+        let mut entry = to_entry(usage);
+        entry.api_ts = Some(entry.ts);
+        cache.entries.insert(alias.to_string(), entry);
         cache.retry_until_ms.remove(alias);
         save_cache(&cache)
     }) {
@@ -292,6 +304,8 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }
 }
 
+/// How often an alias fed by the status line still asks the usage endpoint.
+const ENDPOINT_REFRESH_SECS: u64 = 15 * 60;
 /// How long a status-line reading with the same numbers keeps the stored one.
 const LIVE_REFRESH_SECS: u64 = 60;
 /// The status line must not hang behind a busy cache.
@@ -329,10 +343,14 @@ pub fn put_live_windows(
         {
             return Ok(false);
         }
+        // A first reading counts as fresh; afterwards keep the endpoint's time.
+        let api_ts = cache.entries.get(alias).map_or(now, |entry| entry.api_ts.unwrap_or(entry.ts));
         usage.fetched_at = i64::try_from(now).ok();
         usage.primary = primary.or(usage.primary);
         usage.secondary = secondary.or(usage.secondary);
-        cache.entries.insert(alias.to_string(), to_entry(&usage));
+        let mut entry = to_entry(&usage);
+        entry.api_ts = Some(api_ts);
+        cache.entries.insert(alias.to_string(), entry);
         save_cache(&cache)?;
         Ok(true)
     })

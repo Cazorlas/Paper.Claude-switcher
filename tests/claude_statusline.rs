@@ -360,3 +360,29 @@ async fn statusline_tee_echoes_garbage_unchanged() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"not json");
 }
+
+/// The status line keeps the active account's 5h/7d fresh, but only the usage
+/// endpoint carries the rest (the session-reset state, per-model windows), so
+/// that is still asked about every 15 minutes - not on every `list`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statusline_fed_account_still_reaches_the_endpoint_every_15_minutes() {
+    let f = Fixture::new("U1").await;
+    let output = f.run_with_stdin(&["statusline"], &rate_limits_stdin());
+    assert!(output.status.success());
+
+    // Fresh from the status line: no request.
+    f.rows();
+    assert_eq!(f.mock.usage_requests_for("tokA"), 0);
+
+    // Its last endpoint answer is 16 minutes old: one request, then none.
+    let path = f.path("app/cache.json");
+    let mut cache: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let old = chrono::Utc::now().timestamp() - 16 * 60;
+    cache["entries"]["personal"]["api_ts"] = json!(old);
+    fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+    f.rows();
+    assert_eq!(f.mock.usage_requests_for("tokA"), 1, "the endpoint is asked once");
+    f.rows();
+    assert_eq!(f.mock.usage_requests_for("tokA"), 1, "and not again within 15 minutes");
+}
