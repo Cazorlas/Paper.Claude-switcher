@@ -10,6 +10,7 @@ pub use entry::run_cli;
 
 pub mod auth;
 pub mod auth_policy;
+pub mod claude_api;
 #[allow(dead_code)]
 mod cache;
 #[allow(dead_code)]
