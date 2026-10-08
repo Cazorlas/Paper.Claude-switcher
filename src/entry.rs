@@ -221,12 +221,7 @@ async fn dispatch(
         }
         Commands::Delete { alias, yes } => commands::delete_cmd(&alias, yes, json)?,
         Commands::Login { alias } => commands::login_cmd(alias.as_deref(), json)?,
-        Commands::SelfUpdate {
-            check,
-            version,
-            dev,
-            stable,
-        } => commands::self_update_cmd(check, version.as_deref(), dev, stable, json).await?,
+        Commands::SelfUpdate { check } => commands::self_update_cmd(check, json)?,
         Commands::Launch { alias, args, .. } => {
             let args = merge_launch_args(args, launch_passthrough);
             commands::launch_cmd(alias.as_deref(), args, json).await?

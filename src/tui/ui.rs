@@ -14,7 +14,7 @@ use super::popup;
 use super::theme::{
     BG, C_BLUE, C_CYAN, C_GRAY, C_GREEN, C_MAGENTA, C_RED, C_WHITE, C_YELLOW, DIM, base, highlight,
 };
-use crate::jwt::PlanKind;
+use crate::claude_usage::PlanKind;
 use crate::output::{
     format_local_time, format_reset_short, format_reset_time,
 };
@@ -232,9 +232,9 @@ fn render_help_popup(
         for (cmd, what) in [
             ("list", "usage of every account, numbered"),
             ("use [n|alias]", "switch to the best account, or to number n / alias"),
-            ("login [alias]", "add an account (--device on a headless machine)"),
+            ("login [alias]", "save the current Claude Code login as an account"),
             ("auto", "switch automatically near the limit; stop with Ctrl+C or close the window"),
-            ("launch --auto-swap", "run Codex and move the session to a better account at the limit"),
+            ("launch [alias]", "switch to the account, then start Claude Code"),
             ("delete / restore", "remove an account / bring a deleted one back"),
             ("self-update", "update to the newest version"),
             ("uninstall", "remove the program (asks before deleting your data)"),
@@ -520,7 +520,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
             };
 
             let (card_until, card_until_level) =
-                crate::jwt::subscription_label(entry.info.subscription_until, now);
+                crate::claude_usage::subscription_label(entry.info.subscription_until, now);
             let dim = base().fg(DIM);
             cards.push(vec![
                 Line::from(vec![
@@ -544,7 +544,7 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(format!("  {status_text}"), base().fg(status_color)),
                     Span::styled(
                         format!("  until {card_until}"),
-                        base().fg(if card_until_level == crate::jwt::ExpiryLevel::Soon {
+                        base().fg(if card_until_level == crate::claude_usage::ExpiryLevel::Soon {
                             C_YELLOW
                         } else {
                             DIM
@@ -576,10 +576,10 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
             }
             cells.push(Cell::from(reset_7d).style(base().fg(reset_7d_color)));
             let (until_text, until_level) =
-                crate::jwt::subscription_label(entry.info.subscription_until, now);
+                crate::claude_usage::subscription_label(entry.info.subscription_until, now);
             let until_color = match until_level {
-                crate::jwt::ExpiryLevel::Soon => C_YELLOW,
-                crate::jwt::ExpiryLevel::Ok => C_GRAY,
+                crate::claude_usage::ExpiryLevel::Soon => C_YELLOW,
+                crate::claude_usage::ExpiryLevel::Ok => C_GRAY,
                 _ => DIM,
             };
             cells.push(Cell::from(until_text).style(base().fg(until_color)));
@@ -1657,7 +1657,7 @@ fn short_label(label: &str) -> &str {
         "use (switch to)" => "use",
         "show this help (main view)" => "help",
         "quit (main view)" => "quit",
-        "launch Codex" => "launch",
+        "launch Claude Code" => "launch",
         other => other,
     }
 }
@@ -1696,9 +1696,9 @@ fn status_bar_height(app: &App, width: u16) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jwt::AccountInfo;
+    use crate::claude_usage::AccountInfo;
     use crate::tui::app::{AccountEntry, App, Tab, UsageStatus};
-    use crate::usage::{AdditionalRateLimit, ResetCredit, UsageInfo, WindowUsage};
+    use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
     use ratatui::style::Modifier;
     use ratatui::{Terminal, backend::TestBackend, layout::Rect};
     use std::io::Write;
@@ -1844,22 +1844,6 @@ mod tests {
 
 
 
-    fn reset_credit_expiring_in(seconds: i64) -> ResetCredit {
-        ResetCredit {
-            id: format!("credit-{seconds}"),
-            granted_at: None,
-            expires_at: Some(
-                chrono::DateTime::from_timestamp(crate::auth::now_unix_secs() + seconds, 0)
-                    .unwrap()
-                    .to_rfc3339(),
-            ),
-        }
-    }
-
-
-
-
-
     #[test]
     fn additional_quota_pool_expands_the_main_detail_panel() {
         let window = WindowUsage {
@@ -1871,8 +1855,8 @@ mod tests {
             primary: Some(window.clone()),
             secondary: Some(window.clone()),
             additional_limits: vec![AdditionalRateLimit {
-                limit_name: Some("GPT-6-Codex-Burst".to_string()),
-                metered_feature: Some("codex_futureburst".to_string()),
+                limit_name: Some("Fable".to_string()),
+                metered_feature: Some("fable".to_string()),
                 primary: Some(window.clone()),
                 secondary: Some(window),
                 ..Default::default()
@@ -1887,8 +1871,8 @@ mod tests {
     fn additional_primary_slot_uses_its_real_seven_day_window_for_label_and_pace() {
         let usage = UsageInfo {
             additional_limits: vec![AdditionalRateLimit {
-                limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-                metered_feature: Some("codex_bengalfox".to_string()),
+                limit_name: Some("Opus".to_string()),
+                metered_feature: Some("opus".to_string()),
                 primary: Some(WindowUsage {
                     used_percent: Some(8.0),
                     resets_at: Some(crate::auth::now_unix_secs() + 6 * 24 * 60 * 60),

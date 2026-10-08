@@ -132,15 +132,6 @@ Examples:
         /// Check whether a newer version is available without installing it
         #[arg(long)]
         check: bool,
-        /// Install a specific newer version instead of the latest release
-        #[arg(long, conflicts_with_all = ["dev", "stable"])]
-        version: Option<String>,
-        /// Switch to the dev channel (latest dev build)
-        #[arg(long, conflicts_with = "stable")]
-        dev: bool,
-        /// Switch back to the stable channel (from dev)
-        #[arg(long, conflicts_with = "dev")]
-        stable: bool,
     },
     /// Switch to a profile, then run Claude Code
     #[command(after_help = "Pass Claude Code arguments after --.
@@ -163,14 +154,14 @@ Example: paper-claude-switch launch work -- --resume")]
     Doctor,
 }
 
-/// Split `paper-claude-switch launch …` so Codex argv is never parsed as a
+/// Split `paper-claude-switch launch …` so Claude Code argv is never parsed as a
 /// paper-claude-switch alias or global flag.
 ///
 /// Clap treats a bare `--` as "stop parsing flags" but still fills the next
 /// positional, so `launch -- work` would otherwise become alias `work`. A
-/// known Codex subcommand (`exec`, `resume`, …) or a non-launch flag (`-s`)
-/// in the alias slot is treated the same way, so `launch exec --json` is not
-/// `profile 'exec' not found`.
+/// known Claude Code subcommand (`mcp`, `config`, …) or a non-launch flag (`-p`)
+/// in the alias slot is treated the same way, so `launch mcp --json` is not
+/// `profile 'mcp' not found`.
 pub(crate) fn extract_launch_passthrough(argv: &[String]) -> (Vec<String>, Option<Vec<String>>) {
     let Some(launch_at) = first_subcommand(argv).filter(|&i| argv[i] == "launch") else {
         return (argv.to_vec(), None);
@@ -185,7 +176,7 @@ pub(crate) fn extract_launch_passthrough(argv: &[String]) -> (Vec<String>, Optio
             i += skip;
             continue;
         }
-        if arg.starts_with('-') || is_codex_subcommand(arg) {
+        if arg.starts_with('-') || is_claude_subcommand(arg) {
             return (argv[..i].to_vec(), Some(argv[i..].to_vec()));
         }
         if let Some(rel) = argv[i + 1..].iter().position(|next| next == "--") {
@@ -198,8 +189,8 @@ pub(crate) fn extract_launch_passthrough(argv: &[String]) -> (Vec<String>, Optio
 }
 
 /// Concatenate clap's trailing launch args with argv taken from after `--`
-/// (or from a Codex subcommand / foreign flag). `launch work exec -- --json`
-/// must keep `exec`.
+/// (or from a Claude Code subcommand / foreign flag). `launch work mcp -- --json`
+/// must keep `mcp`.
 pub(crate) fn merge_launch_args(
     clap_args: Vec<String>,
     passthrough: Option<Vec<String>>,
@@ -229,7 +220,7 @@ fn skip_launch_or_global_flag(argv: &[String], i: usize) -> Option<usize> {
     };
     match name {
         "json" | "json-pretty" | "debug" | "help" | "version" => Some(1),
-        "model" | "proxy" | "color" => {
+        "proxy" | "color" => {
             if has_eq || i + 1 >= argv.len() || argv[i + 1] == "--" || argv[i + 1].starts_with('-')
             {
                 Some(1)
@@ -241,35 +232,19 @@ fn skip_launch_or_global_flag(argv: &[String], i: usize) -> Option<usize> {
     }
 }
 
-pub(crate) fn is_codex_subcommand(name: &str) -> bool {
+/// Claude Code's own subcommands: in the alias slot of `launch` they start
+/// the passthrough instead of naming a profile.
+pub(crate) fn is_claude_subcommand(name: &str) -> bool {
     matches!(
         name,
-        "agents"
-            | "exec"
-            | "review"
-            | "login"
-            | "logout"
-            | "mcp"
+        "mcp"
+            | "config"
             | "plugin"
-            | "mcp-server"
-            | "app-server"
-            | "remote-control"
-            | "completion"
-            | "update"
             | "doctor"
-            | "sandbox"
-            | "debug"
-            | "apply"
-            | "resume"
-            | "queue"
-            | "archive"
-            | "delete"
-            | "migrate-rollouts"
-            | "unarchive"
-            | "fork"
-            | "cloud"
-            | "exec-server"
-            | "features"
+            | "update"
+            | "install"
+            | "setup-token"
+            | "migrate-installer"
             | "help"
     )
 }
@@ -327,41 +302,41 @@ mod tests {
     }
 
     #[test]
-    fn launch_passthrough_after_double_dash_keeps_codex_exec_json_and_color() {
+    fn launch_passthrough_after_double_dash_keeps_claude_exec_json_and_color() {
         let (json, alias, model, args) = parse_launch(&[
             "paper-claude-switch",
             "launch",
             "work",
             "--",
-            "exec",
+            "mcp",
             "--json",
             "--color",
             "never",
             "do the thing",
         ]);
-        assert!(!json, "Codex --json after -- must not turn on cs --json");
+        assert!(!json, "Claude Code --json after -- must not turn on cs --json");
         assert_eq!(alias.as_deref(), Some("work"));
         assert_eq!(model, None);
-        assert_eq!(args, ["exec", "--json", "--color", "never", "do the thing"]);
+        assert_eq!(args, ["mcp", "--json", "--color", "never", "do the thing"]);
     }
 
     #[test]
-    fn launch_without_double_dash_must_not_steal_codex_exec_json() {
+    fn launch_without_double_dash_must_not_steal_claude_exec_json() {
         let (json, alias, model, args) = parse_launch(&[
             "paper-claude-switch",
             "launch",
             "work",
-            "exec",
+            "mcp",
             "--json",
             "do the thing",
         ]);
         assert!(
             !json,
-            "cs --json is global and currently steals Codex exec --json; this test names the contract"
+            "cs --json is global and currently steals Claude Code exec --json; this test names the contract"
         );
         assert_eq!(alias.as_deref(), Some("work"));
         assert_eq!(model, None);
-        assert_eq!(args, ["exec", "--json", "do the thing"]);
+        assert_eq!(args, ["mcp", "--json", "do the thing"]);
     }
 
     #[test]
@@ -372,27 +347,27 @@ mod tests {
             "launch",
             "work",
             "--",
-            "exec",
+            "mcp",
             "--json",
         ]);
         assert!(json);
         assert_eq!(alias.as_deref(), Some("work"));
-        assert_eq!(args, ["exec", "--json"]);
+        assert_eq!(args, ["mcp", "--json"]);
     }
 
     #[test]
-    fn launch_model_after_double_dash_is_codex_model_not_cs_model() {
+    fn launch_model_after_double_dash_is_claude_model_not_cs_model() {
         let (_, alias, model, args) = parse_launch(&[
             "paper-claude-switch",
             "launch",
             "openrouter",
             "--",
             "--model",
-            "openai/gpt-5.3-codex",
+            "opus",
         ]);
         assert_eq!(alias.as_deref(), Some("openrouter"));
         assert_eq!(model, None);
-        assert_eq!(args, ["--model", "openai/gpt-5.3-codex"]);
+        assert_eq!(args, ["--model", "opus"]);
     }
 
     #[test]
@@ -418,7 +393,7 @@ mod tests {
             "launch",
             "work",
             "--",
-            "exec",
+            "mcp",
             "--json",
             "do the thing",
         ]);
@@ -435,22 +410,22 @@ mod tests {
             }
             other => panic!("expected launch, got {other:?}"),
         }
-        assert_eq!(right, Some(argv(&["exec", "--json", "do the thing"])));
+        assert_eq!(right, Some(argv(&["mcp", "--json", "do the thing"])));
     }
 
     #[test]
-    fn extract_launch_passthrough_preserves_codex_double_dash() {
+    fn extract_launch_passthrough_preserves_claude_double_dash() {
         let raw = argv(&[
             "paper-claude-switch",
             "launch",
             "work",
             "--",
-            "exec",
+            "mcp",
             "--",
             "--looks-like-flag",
         ]);
         let (_, right) = extract_launch_passthrough(&raw);
-        assert_eq!(right, Some(argv(&["exec", "--", "--looks-like-flag"])));
+        assert_eq!(right, Some(argv(&["mcp", "--", "--looks-like-flag"])));
     }
 
     #[test]
@@ -462,12 +437,12 @@ mod tests {
     }
 
     #[test]
-    fn launch_without_double_dash_must_not_steal_codex_exec_color() {
+    fn launch_without_double_dash_must_not_steal_claude_exec_color() {
         let cli = Cli::try_parse_from([
             "paper-claude-switch",
             "launch",
             "work",
-            "exec",
+            "mcp",
             "--color",
             "never",
             "do",
@@ -479,9 +454,9 @@ mod tests {
                 assert_eq!(
                     cli.color,
                     ColorMode::Auto,
-                    "Codex exec --color must not change cs --color"
+                    "Claude Code exec --color must not change cs --color"
                 );
-                assert_eq!(args, ["exec", "--color", "never", "do"]);
+                assert_eq!(args, ["mcp", "--color", "never", "do"]);
             }
             other => panic!("expected launch, got {other:?}"),
         }
@@ -523,30 +498,30 @@ mod tests {
             "paper-claude-switch",
             "launch",
             "work",
-            "exec",
+            "mcp",
             "--",
             "--json",
             "hi",
         ]);
         assert!(!json);
         assert_eq!(alias.as_deref(), Some("work"));
-        assert_eq!(args, ["exec", "--json", "hi"]);
+        assert_eq!(args, ["mcp", "--json", "hi"]);
     }
 
     #[test]
-    fn launch_exec_without_double_dash_is_codex_not_an_alias() {
+    fn launch_exec_without_double_dash_is_claude_not_an_alias() {
         let (json, alias, _, args) =
-            parse_launch(&["paper-claude-switch", "launch", "exec", "--json", "do the thing"]);
+            parse_launch(&["paper-claude-switch", "launch", "mcp", "--json", "do the thing"]);
         assert!(
             !json,
-            "Codex exec --json must not turn on cs --json when exec is the first token"
+            "Claude Code exec --json must not turn on cs --json when exec is the first token"
         );
         assert_eq!(alias, None);
-        assert_eq!(args, ["exec", "--json", "do the thing"]);
+        assert_eq!(args, ["mcp", "--json", "do the thing"]);
     }
 
     #[test]
-    fn launch_sandbox_flag_without_double_dash_is_codex_not_a_parse_error() {
+    fn launch_sandbox_flag_without_double_dash_is_claude_not_a_parse_error() {
         let (_, alias, _, args) = parse_launch(&[
             "paper-claude-switch",
             "launch",
@@ -571,18 +546,27 @@ mod tests {
     }
 
     #[test]
-    fn launch_resume_without_alias_is_codex_subcommand() {
-        let (_, alias, _, args) = parse_launch(&["paper-claude-switch", "launch", "resume", "--last"]);
+    fn launch_claude_flag_without_alias_is_passthrough() {
+        let (_, alias, _, args) =
+            parse_launch(&["paper-claude-switch", "launch", "--continue"]);
         assert_eq!(alias, None);
-        assert_eq!(args, ["resume", "--last"]);
+        assert_eq!(args, ["--continue"]);
+    }
+
+    #[test]
+    fn launch_claude_subcommand_without_alias_is_passthrough() {
+        let (_, alias, _, args) =
+            parse_launch(&["paper-claude-switch", "launch", "mcp", "list"]);
+        assert_eq!(alias, None);
+        assert_eq!(args, ["mcp", "list"]);
     }
 
     #[test]
     fn merge_launch_args_keeps_left_tokens_then_right() {
         assert_eq!(
-            merge_launch_args(argv(&["exec"]), Some(argv(&["--json", "hi"]))),
-            argv(&["exec", "--json", "hi"])
+            merge_launch_args(argv(&["mcp"]), Some(argv(&["--json", "hi"]))),
+            argv(&["mcp", "--json", "hi"])
         );
-        assert_eq!(merge_launch_args(argv(&["exec"]), None), argv(&["exec"]));
+        assert_eq!(merge_launch_args(argv(&["mcp"]), None), argv(&["mcp"]));
     }
 }

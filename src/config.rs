@@ -20,8 +20,6 @@ pub struct AppConfig {
     pub tui: TuiConfig,
     #[serde(rename = "use")]
     pub use_cfg: UseConfig,
-    #[serde(default)]
-    pub launch: LaunchConfig,
 }
 
 impl AppConfig {
@@ -36,13 +34,6 @@ impl AppConfig {
                 self.tui.auto_refresh_interval_secs
             ));
             self.tui.auto_refresh_interval_secs = 30;
-        }
-        // Not merely a tidy default: at zero, `launch` restores the original
-        // auth.json before Codex has read the staged one, so the session runs
-        // on the wrong account with nothing reporting it.
-        if self.launch.restore_delay_secs == 0 {
-            warnings.push("config.launch.restore_delay_secs=0 is invalid; using 3 instead".into());
-            self.launch.restore_delay_secs = 3;
         }
         self
     }
@@ -112,23 +103,6 @@ impl Default for UseConfig {
         Self {
             safety_margin_7d: 20.0,
             team_priority: true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LaunchConfig {
-    /// Seconds to wait after starting codex before restoring auth.json (default: 3).
-    /// Codex CLI reads auth.json only at startup; this delay ensures it finishes reading
-    /// before the original auth is restored.
-    pub restore_delay_secs: u64,
-}
-
-impl Default for LaunchConfig {
-    fn default() -> Self {
-        Self {
-            restore_delay_secs: 3,
         }
     }
 }
@@ -306,20 +280,4 @@ mod tests {
         assert_eq!(config.tui.auto_refresh_interval_secs, 300);
     }
 
-    /// A zero restore delay makes `launch` put the original auth.json back
-    /// before Codex has read the staged one, so the session silently runs on
-    /// the wrong account. Every sibling interval already gets this treatment.
-    #[test]
-    fn launch_zero_restore_delay_uses_default_and_warns() {
-        let (config, warnings) =
-            super::load_from_str_with_warnings("[launch]\nrestore_delay_secs = 0\n").unwrap();
-
-        assert_eq!(config.launch.restore_delay_secs, 3);
-        assert!(
-            warnings
-                .iter()
-                .any(|warning| warning.contains("restore_delay_secs")),
-            "a silently-corrected launch delay is what hands Codex the wrong account: {warnings:?}"
-        );
-    }
 }

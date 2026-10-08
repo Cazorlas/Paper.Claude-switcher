@@ -2,22 +2,6 @@ use crate::output::print_json;
 use crate::{auth, claude_store, claude_usage, color};
 use anyhow::{Context, Result};
 
-pub(crate) fn format_resync_confirm_prompt(
-    alias: &str,
-    live_last_refresh: Option<&str>,
-    profile_last_refresh: Option<&str>,
-) -> String {
-    let live_ts = live_last_refresh.unwrap_or("unknown");
-    let profile_ts = profile_last_refresh.unwrap_or("unknown");
-    format!(
-        "Update profile '{alias}' with live credentials? (live last_refresh={live_ts} -> profile last_refresh={profile_ts}) [Y/n] "
-    )
-}
-
-
-
-
-
 // ── open ─────────────────────────────────────────────────
 
 pub(crate) fn open_cmd() -> Result<()> {
@@ -134,17 +118,3 @@ pub(crate) fn doctor_cmd(json: bool) -> Result<()> {
     if ok { Ok(()) } else { Err(crate::output::OutputAlreadyReported.into()) }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_resync_confirm_prompt;
-
-    #[test]
-    fn resync_prompt_shows_direction_and_missing_timestamps() {
-        let prompt = format_resync_confirm_prompt("acme", Some("2026-07-20T00:00:00Z"), None);
-
-        assert_eq!(
-            prompt,
-            "Update profile 'acme' with live credentials? (live last_refresh=2026-07-20T00:00:00Z -> profile last_refresh=unknown) [Y/n] "
-        );
-    }
-}

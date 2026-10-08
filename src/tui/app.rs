@@ -13,8 +13,7 @@ use tokio::sync::Semaphore;
 
 use crate::auth;
 use crate::cache;
-use crate::jwt::AccountInfo;
-use crate::login;
+use crate::claude_usage::AccountInfo;
 use crate::output::format_local_timestamp;
 use crate::profile::{
     cmd_delete, list_profiles, profile_auth_path, read_current, rename_profile,
@@ -24,7 +23,6 @@ use crate::usage::{
     Refresh, UsageError, UsageInfo, fetch_usage_retried,
     fetch_usage_retried_force, fetch_usage_retried_unattended,
 };
-use crate::usage::models::ModelEntry;
 
 async fn with_usage_limiter<T>(limiter: &Semaphore, operation: impl Future<Output = T>) -> T {
     let _permit = limiter
@@ -62,10 +60,6 @@ fn refresh_fetches_loaded_usage(refresh: Refresh) -> bool {
     !matches!(refresh, Refresh::Cached)
 }
 
-fn refresh_forces_negative_caches(refresh: Refresh) -> bool {
-    matches!(refresh, Refresh::Forced)
-}
-
 fn refresh_priority(refresh: Refresh) -> u8 {
     match refresh {
         Refresh::Cached => 0,
@@ -73,15 +67,6 @@ fn refresh_priority(refresh: Refresh) -> u8 {
         Refresh::Forced => 2,
     }
 }
-
-#[derive(Debug, Clone)]
-pub enum ModelStatus {
-    Loading,
-    Loaded(Vec<ModelEntry>),
-    Error(String),
-}
-
-const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 enum SwitchCompletion {
@@ -163,9 +148,8 @@ pub struct SearchState {
     pub cursor: usize,
 }
 
-/// Which top-level TUI tab is active. Accounts (ChatGPT OAuth), Providers
-/// (third-party API + key), and Settings (`config.toml`) stay isolated so
-/// their key bindings never mix.
+/// Which top-level TUI tab is active. Accounts, Settings (`config.toml`) and
+/// Logs stay isolated so their key bindings never mix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tab {
     #[default]
@@ -201,8 +185,6 @@ pub struct App {
     pub usage_next_id: u64,
     pub pending_results: tokio::sync::mpsc::Receiver<(String, u64, Result<UsageInfo, UsageError>)>,
     pub result_sender: tokio::sync::mpsc::Sender<(String, u64, Result<UsageInfo, UsageError>)>,
-    pub pending_workspace: tokio::sync::mpsc::Receiver<String>,
-    pub workspace_sender: tokio::sync::mpsc::Sender<String>,
     pub confirm: Option<ConfirmAction>,
     pub rename: Option<RenameState>,
     pub usage_limiter: Arc<Semaphore>,
@@ -218,16 +200,6 @@ pub struct App {
     last_list_click: Option<(Tab, String, Instant)>,
     /// Regions from the last drawn frame, used for mouse hit-testing.
     pub hitmap: super::hitmap::HitMap,
-    /// Per-alias model list cache, refreshed after five minutes. Populated lazily
-    /// for the selected account or when its account details are opened.
-    pub model_cache: HashMap<String, ModelStatus>,
-    model_cached_at: HashMap<String, Instant>,
-    /// Active model-list request ID per alias. Late responses from a request
-    /// invalidated by an explicit refresh must not replace newer data.
-    model_requests: HashMap<String, u64>,
-    model_next_id: u64,
-    pub pending_models: tokio::sync::mpsc::Receiver<(String, u64, Result<Vec<ModelEntry>, String>)>,
-    pub model_sender: tokio::sync::mpsc::Sender<(String, u64, Result<Vec<ModelEntry>, String>)>,
     pending_switches: tokio::sync::mpsc::Receiver<SwitchCompletion>,
     switch_sender: tokio::sync::mpsc::Sender<SwitchCompletion>,
     switching_alias: Option<String>,
@@ -236,8 +208,6 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
-        let (workspace_tx, workspace_rx) = tokio::sync::mpsc::channel(128);
-        let (model_tx, model_rx) = tokio::sync::mpsc::channel(32);
         let (switch_tx, switch_rx) = tokio::sync::mpsc::channel(4);
         let cfg = crate::config::get();
         App {
@@ -264,8 +234,6 @@ impl App {
             usage_next_id: 0,
             pending_results: rx,
             result_sender: tx,
-            pending_workspace: workspace_rx,
-            workspace_sender: workspace_tx,
             confirm: None,
             rename: None,
             usage_limiter: Arc::new(Semaphore::new(cfg.network.max_concurrent)),
@@ -279,123 +247,9 @@ impl App {
             menu: None,
             last_list_click: None,
             hitmap: super::hitmap::HitMap::default(),
-            model_cache: HashMap::new(),
-            model_cached_at: HashMap::new(),
-            model_requests: HashMap::new(),
-            model_next_id: 0,
-            pending_models: model_rx,
-            model_sender: model_tx,
             pending_switches: switch_rx,
             switch_sender: switch_tx,
             switching_alias: None,
-        }
-    }
-
-
-
-
-
-
-
-
-
-    /// Kick off a model-list fetch for `alias` if the detail panel needs it
-    /// and it has no fresh result or pending request. Both successes and errors
-    /// expire, without retrying a failure on every rendered frame.
-    pub fn ensure_models_loaded(&mut self, alias: &str) {
-        if self.model_requests.contains_key(alias)
-            || matches!(self.model_cache.get(alias), Some(ModelStatus::Loading))
-        {
-            return;
-        }
-        if self.model_cache.contains_key(alias) {
-            let fetched_at = self
-                .model_cached_at
-                .entry(alias.to_string())
-                .or_insert_with(Instant::now);
-            if fetched_at.elapsed() < MODEL_CACHE_TTL {
-                return;
-            }
-        }
-        // Claude Code has no per-account model list to fetch.
-        if true {
-            return;
-        }
-        let path = match profile_auth_path(alias) {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-        if !self.model_cache.contains_key(alias) {
-            self.model_cache
-                .insert(alias.to_string(), ModelStatus::Loading);
-        }
-        let request_id = self.model_next_id;
-        self.model_next_id = self.model_next_id.wrapping_add(1);
-        self.model_requests.insert(alias.to_string(), request_id);
-        let alias_owned = alias.to_string();
-        let tx = self.model_sender.clone();
-        let limiter = self.usage_limiter.clone();
-        tokio::spawn(async move {
-            let _permit = limiter.acquire().await;
-            let result = crate::usage::models::fetch_models_for_profile(&alias_owned, &path)
-                .await
-                .map_err(|e| e.to_string());
-            let _ = tx.send((alias_owned, request_id, result)).await;
-        });
-    }
-
-    /// Fetch the model list for the currently-selected account, if the
-    /// detail panel is visible. No-op when nothing is selected.
-    pub fn ensure_models_loaded_for_selected(&mut self) {
-        if !self.detail_visible {
-            return;
-        }
-        if let Some(alias) = self
-            .selected_account_idx()
-            .and_then(|idx| self.accounts.get(idx))
-            .map(|e| e.alias.clone())
-        {
-            self.ensure_models_loaded(&alias);
-        }
-    }
-
-    pub fn poll_model_results(&mut self) {
-        let mut refresh_open_account = false;
-        while let Ok((alias, request_id, result)) = self.pending_models.try_recv() {
-            if self.model_requests.get(&alias).copied() != Some(request_id) {
-                continue;
-            }
-            self.model_requests.remove(&alias);
-            self.model_cached_at.insert(alias.clone(), Instant::now());
-            refresh_open_account |= matches!(
-                self.menu.as_ref(),
-                Some(super::menu::MenuState::Account { info, .. }) if info.alias == alias
-            );
-            match result {
-                Ok(models) => {
-                    self.model_cache
-                        .insert(alias.clone(), ModelStatus::Loaded(models));
-                }
-                Err(e) => {
-                    self.model_cache
-                        .insert(alias.clone(), ModelStatus::Error(e));
-                }
-            };
-
-        }
-        if refresh_open_account {
-            self.rebuild_open_account_menu();
-        }
-    }
-
-    fn rebuild_open_account_menu(&mut self) {
-        let scroll = match self.menu.as_ref() {
-            Some(super::menu::MenuState::Account { popup, .. }) => popup.scroll,
-            _ => return,
-        };
-        self.open_account_menu();
-        if let Some(super::menu::MenuState::Account { popup, .. }) = self.menu.as_mut() {
-            popup.scroll = scroll;
         }
     }
 
@@ -411,8 +265,6 @@ impl App {
         let Some(account_idx) = self.selected_account_idx() else {
             return;
         };
-        let alias = self.accounts[account_idx].alias.clone();
-        self.ensure_models_loaded(&alias);
         let entry = &self.accounts[account_idx];
         let loaded_usage = match &entry.usage {
             UsageStatus::Loaded(u) => Some(u.as_ref()),
@@ -460,29 +312,6 @@ impl App {
             .into_iter()
             .flat_map(wrap_account_detail_line)
             .collect();
-        let models: Vec<String> = match self.model_cache.get(&entry.alias) {
-            Some(ModelStatus::Loaded(models)) => crate::usage::models::sorted_models_for_display(models)
-                .into_iter()
-                .map(|model| {
-                    let label = match &model.display_name {
-                        Some(name) => name.clone(),
-                        None => model.slug.clone(),
-                    };
-                    let default = model
-                        .default_reasoning_effort
-                        .as_deref()
-                        .unwrap_or("not reported");
-                    let allowed = if model.supported_reasoning_efforts.is_empty() {
-                        "not reported".to_string()
-                    } else {
-                        model.supported_reasoning_efforts.join(", ")
-                    };
-                    format!("  {label} · default {default} · allowed {allowed}")
-                })
-                .collect(),
-            Some(ModelStatus::Error(error)) => vec![format!("  error: {error}")],
-            _ => Vec::new(),
-        };
         let auth_expiries = profile_auth_path(&entry.alias)
             .ok()
             .and_then(|path| auth::read_auth(&path).ok())
@@ -500,50 +329,12 @@ impl App {
                 alias: entry.alias.clone(),
                 email: entry.info.email.clone(),
                 account_id: entry.info.account_id.clone(),
-                user_id: entry.info.user_id.clone(),
-                workspace_name: entry.info.workspace_name.clone(),
-                is_fedramp: entry.info.is_fedramp,
                 plan_label: entry.info.plan_label_with(plan),
                 plan_type: plan.map(str::to_string),
                 is_current: entry.is_current,
-                organizations: entry
-                    .info
-                    .organizations
-                    .iter()
-                    .filter(|organization| !organization.title.is_empty())
-                    .map(|organization| {
-                        let role = organization
-                            .role
-                            .split(['_', '-'])
-                            .filter(|part| !part.is_empty())
-                            .map(|part| {
-                                let mut chars = part.chars();
-                                chars
-                                    .next()
-                                    .map(|first| {
-                                        first.to_uppercase().collect::<String>() + chars.as_str()
-                                    })
-                                    .unwrap_or_default()
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" ");
-                        format!(
-                            "{} · {}{}",
-                            organization.title,
-                            if role.is_empty() { "Member" } else { &role },
-                            if organization.is_default {
-                                " · default workspace"
-                            } else {
-                                ""
-                            }
-                        )
-                    })
-                    .flat_map(wrap_account_detail_line)
-                    .collect(),
                 auth_expiries,
                 usage: loaded_usage.cloned().map(Box::new),
                 usage_meta,
-                models,
             },
         ));
     }
@@ -554,17 +345,6 @@ impl App {
             return;
         }
         self.menu = Some(super::menu::MenuState::batch(count));
-    }
-
-    pub fn open_batch_relogin_flow(&mut self) {
-        let count = self.marked.len();
-        if count == 0 {
-            return;
-        }
-        if self.defer_while_switching("re-logging in") {
-            return;
-        }
-        self.menu = Some(super::menu::MenuState::batch_relogin_flow(count));
     }
 
     pub fn open_add_menu(&mut self) {
@@ -756,10 +536,15 @@ impl App {
         match click { super::hitmap::OverlayClick::Key(code) => Some(code) }
     }
 
-    fn invalidate_model_request(&mut self, alias: &str) {
-        self.model_cache.remove(alias);
-        self.model_cached_at.remove(alias);
-        self.model_requests.remove(alias);
+    fn rebuild_open_account_menu(&mut self) {
+        let scroll = match self.menu.as_ref() {
+            Some(super::menu::MenuState::Account { popup, .. }) => popup.scroll,
+            _ => return,
+        };
+        self.open_account_menu();
+        if let Some(super::menu::MenuState::Account { popup, .. }) = self.menu.as_mut() {
+            popup.scroll = scroll;
+        }
     }
 
     /// Handle synchronous Accounts-list keys. Returns a selected alias when
@@ -818,10 +603,6 @@ impl App {
         None
     }
 
-
-
-
-
     pub fn handle_settings_key(&mut self, code: KeyCode) {
         match self.settings.handle_key(code) {
             super::settings::SettingsOutcome::Continue => {}
@@ -838,26 +619,6 @@ impl App {
         self.usage_limiter = Arc::new(Semaphore::new(cfg.network.max_concurrent.max(1)));
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     pub fn open_relogin_flow_menu(&mut self, alias: String, email: Option<String>) {
         if self.defer_while_switching("re-logging in") {
             return;
@@ -868,10 +629,6 @@ impl App {
     pub fn close_menu(&mut self) {
         self.menu = None;
     }
-
-
-
-
 
     /// Request delete confirmation for a specific alias (called from menu).
     pub fn request_delete_alias(&mut self, alias: &str) {
@@ -982,7 +739,6 @@ impl App {
                 self.selected = view_idx;
             }
         }
-
 
         for problem in account_problems.iter() {
             tracing::warn!("{problem}");
@@ -1127,13 +883,9 @@ impl App {
         else {
             return;
         };
-        self.invalidate_model_request(alias);
         self.fetch_usage_for(idx, Refresh::Forced);
-        self.ensure_models_loaded(alias);
         self.set_status(format!("Refreshing {alias}"), 3);
     }
-
-
 
     pub fn poll_update(&mut self) {
         if let Some(rx) = &mut self.update_rx {
@@ -1191,16 +943,6 @@ impl App {
         });
     }
 
-
-
-
-
-
-
-
-
-
-
     fn get_5h_used_pct(&self, idx: usize) -> f64 {
         match &self.accounts[idx].usage {
             UsageStatus::Loaded(u) => u
@@ -1244,76 +986,37 @@ impl App {
         }
         let needs_usage =
             refresh_fetches_loaded_usage(refresh) || !matches!(entry.usage, UsageStatus::Loaded(_));
-        let force_negative_caches = refresh_forces_negative_caches(refresh);
-        // Claude accounts carry no workspace metadata to look up.
-        let needs_workspace = false;
-        if !needs_usage && !needs_workspace {
+        if !needs_usage {
             return;
         }
 
         let alias = entry.alias.clone();
-        let path = match profile_auth_path(&alias) {
-            Ok(p) => p,
-            Err(e) => {
-                self.set_status_error(format!("Path error for {alias}: {e}"), 5);
-                return;
-            }
-        };
         let limiter = self.usage_limiter.clone();
 
-        if needs_usage && !matches!(self.accounts[idx].usage, UsageStatus::Loaded(_)) {
+        if !matches!(self.accounts[idx].usage, UsageStatus::Loaded(_)) {
             self.accounts[idx].usage = UsageStatus::Loading;
         }
 
         let usage_tx = self.result_sender.clone();
-        let workspace_tx = self.workspace_sender.clone();
-        let request_id = needs_usage.then(|| {
-            let request_id = self.usage_next_id;
-            self.usage_next_id = self.usage_next_id.wrapping_add(1);
-            self.refreshing_requests
-                .insert(alias.clone(), (request_id, refresh));
-            request_id
-        });
+        let request_id = self.usage_next_id;
+        self.usage_next_id = self.usage_next_id.wrapping_add(1);
+        self.refreshing_requests
+            .insert(alias.clone(), (request_id, refresh));
         tokio::spawn(async move {
-            if needs_usage {
-                let result = with_usage_limiter(&limiter, async {
-                    match refresh {
-                        Refresh::Cached => fetch_usage_retried(&alias).await,
-                        Refresh::Unattended => fetch_usage_retried_unattended(&alias).await,
-                        Refresh::Forced => fetch_usage_retried_force(&alias).await,
-                    }
-                })
-                .await;
-                // Usage is independent of best-effort workspace metadata.
-                let _ = usage_tx
-                    .send((alias.clone(), request_id.expect("usage request id"), result))
-                    .await;
-            }
-            if needs_workspace {
-                with_usage_limiter(&limiter, async {
-                    // Read auth after usage because that path may have refreshed the token.
-                    if let Ok(auth) = crate::auth::read_auth(&path)
-                        && let Err(err) = crate::workspace::refresh_for_auth_if_needed(
-                            &auth,
-                            force_negative_caches,
-                        )
-                        .await
-                    {
-                        tracing::debug!("[{alias}] workspace metadata unavailable: {err}");
-                    }
-                })
-                .await;
-                let _ = workspace_tx.send(alias).await;
-            }
+            let result = with_usage_limiter(&limiter, async {
+                match refresh {
+                    Refresh::Cached => fetch_usage_retried(&alias).await,
+                    Refresh::Unattended => fetch_usage_retried_unattended(&alias).await,
+                    Refresh::Forced => fetch_usage_retried_force(&alias).await,
+                }
+            })
+            .await;
+            let _ = usage_tx.send((alias, request_id, result)).await;
         });
     }
 
     fn refresh_indices(&mut self, target_indices: &[usize], refresh: Refresh) {
         for &i in target_indices {
-            let alias = self.accounts[i].alias.clone();
-            if matches!(refresh, Refresh::Forced) {
-                self.invalidate_model_request(&alias);
-            }
             let entry = &mut self.accounts[i];
             if let UsageStatus::Error(_) = &entry.usage {
                 entry.usage = UsageStatus::Idle;
@@ -1378,18 +1081,10 @@ impl App {
                     UsageStatus::Error(e)
                 }
             };
-            crate::cache::apply_workspace_name(&mut self.accounts[idx].info);
             refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
             changed = true;
             if let Some(refresh) = self.pending_usage_refreshes.remove(&alias) {
                 self.fetch_usage_for(idx, refresh);
-            }
-        }
-        while let Ok(alias) = self.pending_workspace.try_recv() {
-            if let Some(entry) = self.accounts.iter_mut().find(|entry| entry.alias == alias) {
-                crate::cache::apply_workspace_name(&mut entry.info);
-                refresh_open_account |= open_account_alias.as_deref() == Some(alias.as_str());
-                changed = true;
             }
         }
         if changed {
@@ -1608,8 +1303,6 @@ impl App {
         false
     }
 
-
-
     pub fn request_batch_delete(&mut self) {
         if self.marked.is_empty() {
             return;
@@ -1637,8 +1330,6 @@ impl App {
         self.refresh_indices(&target_indices, Refresh::Forced);
         self.set_status(format!("Refreshing {count} marked account(s)..."), 3);
     }
-
-
 
     pub fn cancel_confirm(&mut self) {
         self.confirm = None;
@@ -1964,11 +1655,9 @@ async fn run_app(
             break;
         }
         app.poll_results();
-        app.poll_model_results();
         app.poll_update();
         app.tick();
         app.run_due_auto_refresh();
-        app.ensure_models_loaded_for_selected();
 
         terminal
             .draw(|f| super::ui::render(f, &mut app))
@@ -2013,7 +1702,6 @@ async fn run_app(
                         app.handle_settings_key(key.code);
                         continue;
                     }
-
 
                     // Normalize letter case for top-level dispatch:
                     // any uppercase letter is treated as its lowercase equivalent.
@@ -2080,7 +1768,6 @@ async fn run_app(
                 }
                 Event::Mouse(mouse) => {
                     if let Some(code) = app.handle_mouse(mouse) {
-
 
                         if app.rename.is_some() {
                             app.handle_rename_key(code);
@@ -2296,7 +1983,6 @@ async fn handle_menu_key(
             app.start_rename_alias(&alias);
         }
 
-
         MenuAction::DeleteRequest(alias) => {
             if app.defer_while_switching("deleting an account") {
                 return None;
@@ -2309,16 +1995,6 @@ async fn handle_menu_key(
             app.refresh_marked();
         }
 
-        MenuAction::BatchReloginRequest => {
-            app.open_batch_relogin_flow();
-        }
-        MenuAction::BatchRelogin { device } => {
-            if app.defer_while_switching("re-logging in") {
-                return None;
-            }
-            app.close_menu();
-            perform_batch_relogin(terminal, app, device).await;
-        }
         MenuAction::BatchDeleteRequest => {
             if app.defer_while_switching("deleting accounts") {
                 return None;
@@ -2425,8 +2101,8 @@ async fn perform_launch(
     None
 }
 
-/// Suspend the TUI, run OAuth (browser PKCE or device code), persist the
-/// resulting auth.json to the appropriate profile, then restore the TUI.
+/// Suspend the TUI, save the current Claude Code login to the appropriate
+/// profile, then restore the TUI.
 ///
 /// Always restores the terminal even on error so the caller can keep running.
 async fn perform_oauth(
@@ -2435,23 +2111,18 @@ async fn perform_oauth(
     mode: OAuthMode,
     device: bool,
 ) {
-    // Tear down TUI: restore cooked mode + clear screen so the OAuth output
-    // (browser prompts, device user_code, polling progress) is visible.
+    // Tear down TUI: restore cooked mode + clear screen so the result is visible.
     suspend_tui_for_plain_output();
-    // TUI starts with MessageMode::Silent; switch to Stdout so login.rs
-    // user_println calls (device code URL, user_code) are actually shown.
+    // TUI starts with MessageMode::Silent; switch to Stdout so messages show.
     crate::output::set_message_mode(crate::output::MessageMode::Stdout);
 
     let mode_name = match &mode {
-        OAuthMode::Add => "Add new account".to_string(),
-        OAuthMode::Relogin(alias) => format!("Re-login: {alias}"),
+        OAuthMode::Add => "Save the current Claude Code login".to_string(),
+        OAuthMode::Relogin(alias) => {
+            format!("Save the current Claude Code login into '{alias}'")
+        }
     };
-    println!("\n=== {mode_name} ===");
-    if device {
-        println!("Flow: device code\n");
-    } else {
-        println!("Flow: browser (PKCE)\n");
-    }
+    println!("\n=== {mode_name} ===\n");
 
     let result = run_oauth_inner(mode, device).await;
 
@@ -2487,133 +2158,11 @@ async fn perform_oauth(
         }
         Err(e) => {
             tracing::error!(action = "oauth", outcome = "failed", "OAuth failed");
-            app.set_status_error(format!("OAuth failed: {e}"), 7);
+            app.set_status_error(
+                format!("Save failed: {e}. Log in to Claude Code with that account (/login) first."),
+                7,
+            );
         }
-    }
-}
-
-/// Sequentially re-login every marked alias. The TUI is suspended for the
-/// duration; OAuth output goes to the cooked terminal so the user sees
-/// browser prompts / device codes / progress.
-///
-/// User can abort the whole batch with Ctrl+C between rounds (handled by
-/// the underlying login::run_device_*) or by closing the browser tab.
-fn batch_relogin_not_attempted(total: usize, ok: usize, failed: usize, cancelled: bool) -> usize {
-    total.saturating_sub(ok + failed + usize::from(cancelled))
-}
-
-async fn finish_login_or_cancel<T, LoginFuture, CancelFuture>(
-    login_future: LoginFuture,
-    cancel_future: CancelFuture,
-) -> Result<T>
-where
-    LoginFuture: std::future::Future<Output = Result<T>>,
-    CancelFuture: std::future::Future<Output = std::io::Result<()>>,
-{
-    tokio::pin!(login_future);
-    tokio::pin!(cancel_future);
-    tokio::select! {
-        biased;
-        result = &mut login_future => result,
-        signal = &mut cancel_future => {
-            signal.context("listening for Ctrl+C during batch re-login")?;
-            Err(login::LoginCancelled.into())
-        }
-    }
-}
-
-
-
-async fn finish_refresh_then_commit<T, RefreshFuture, Commit>(
-    refresh_future: RefreshFuture,
-    commit: Commit,
-) -> Result<T>
-where
-    RefreshFuture: std::future::Future<Output = ()>,
-    Commit: FnOnce() -> Result<T>,
-{
-    refresh_future.await;
-    commit()
-}
-
-async fn perform_batch_relogin(terminal: &mut DefaultTerminal, app: &mut App, device: bool) {
-    let aliases: Vec<String> = app.marked.iter().cloned().collect();
-    if aliases.is_empty() {
-        return;
-    }
-
-    suspend_tui_for_plain_output();
-    crate::output::set_message_mode(crate::output::MessageMode::Stdout);
-
-    let total = aliases.len();
-    println!("\n=== Batch re-login: {total} account(s) ===");
-    if device {
-        println!("Flow: device code\n");
-    } else {
-        println!("Flow: browser (PKCE)\n");
-    }
-
-    let mut ok = 0usize;
-    let mut failed: Vec<(String, String)> = Vec::new();
-    let mut cancelled = false;
-
-    for (i, alias) in aliases.iter().enumerate() {
-        println!("\n--- [{}/{}] {alias} ---", i + 1, total);
-        let mode = OAuthMode::Relogin(alias.clone());
-        match finish_login_or_cancel(run_oauth_inner(mode, device), tokio::signal::ctrl_c()).await {
-            Ok(_) => ok += 1,
-            Err(e) if login::is_login_cancelled(&e) => {
-                eprintln!("[cancelled] Batch re-login stopped by user");
-                cancelled = true;
-                break;
-            }
-            Err(e) => {
-                eprintln!("[err] {alias}: {e}");
-                failed.push((alias.clone(), e.to_string()));
-            }
-        }
-    }
-
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-    if cancelled {
-        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
-        println!(
-            "\n=== Batch cancelled: {ok} ok, {} failed, 1 cancelled, {not_attempted} not attempted ===",
-            failed.len()
-        );
-    } else {
-        println!("\n=== Batch complete: {ok} ok, {} failed ===", failed.len());
-    }
-    if !failed.is_empty() {
-        for (a, e) in &failed {
-            println!("  - {a}: {e}");
-        }
-    }
-    println!("\nReturning to TUI...");
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-
-    crate::output::set_message_mode(crate::output::MessageMode::Silent);
-    resume_tui_after_plain_output(terminal);
-
-    app.marked.clear();
-    let summary = if cancelled {
-        let not_attempted = batch_relogin_not_attempted(total, ok, failed.len(), true);
-        format!("Batch re-login cancelled: {ok} ok, 1 cancelled, {not_attempted} not attempted")
-    } else if failed.is_empty() {
-        format!("Batch re-login: {ok} ok")
-    } else {
-        format!("Batch re-login: {ok} ok, {} failed", failed.len())
-    };
-    if failed.is_empty() && !cancelled {
-        app.set_status(summary, 8);
-    } else {
-        app.set_status_error(summary, 8);
-    }
-    if app.load_profiles_preserving_selection() {
-        app.refresh(Refresh::Forced);
-    }
-    if app.auto_refresh_enabled {
-        app.next_auto_refresh = Some(Instant::now() + app.auto_refresh_interval);
     }
 }
 
@@ -2685,16 +2234,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        AccountEntry, App, ModelStatus, UsageStatus, batch_relogin_not_attempted,
-        finish_login_or_cancel, finish_refresh_then_commit, refresh_fetches_loaded_usage,
-        refresh_forces_negative_caches, retained_usage_by_alias,
+        AccountEntry, App, UsageStatus, refresh_fetches_loaded_usage, retained_usage_by_alias,
         with_usage_limiter,
     };
     use super::{ConfirmAction, Tab};
     use crate::{
-        jwt::AccountInfo,
+        claude_usage::AccountInfo,
         usage::{Refresh, UsageInfo},
-        usage::models::ModelEntry,
     };
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -2969,8 +2515,6 @@ mod tests {
         assert!(app.menu.is_none());
     }
 
-
-
     #[test]
     fn mouse_wheel_scrolls_logs_and_outside_click_closes_help() {
         let mut app = App::new();
@@ -3050,8 +2594,6 @@ mod tests {
         app.handle_mouse(left_click(0, 0));
         assert!(app.menu.is_none());
     }
-
-
 
     #[test]
     fn rendered_settings_field_click_toggles_boolean_and_starts_text_edit() {
@@ -3160,14 +2702,6 @@ mod tests {
         assert_eq!(app.handle_mouse(left_click(area.x, area.y)), Some(code));
     }
 
-
-
-
-
-
-
-
-
     #[test]
     fn rendered_accounts_footer_actions_return_the_same_keys_as_keyboard() {
         let mut app = App::new();
@@ -3269,20 +2803,8 @@ mod tests {
         assert_eq!(app.handle_mouse(left_click(area.x, area.y)), Some(code));
     }
 
-    fn capture_info_logs(action: impl FnOnce()) -> Vec<String> {
-        let writer = crate::logging::TuiLogWriter::new();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(writer.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, action);
-        writer.lines()
-    }
-
-    /// Isolate `PAPER_CLAUDE_SWITCH_HOME`/`CODEX_HOME` for tests that touch provider
-    /// storage. Serialized via the shared env lock so it can't race sibling
+    /// Isolate `PAPER_CLAUDE_SWITCH_HOME`/`CLAUDE_CONFIG_DIR` for tests that touch
+    /// profiles or the live login, so they never reach the real `~/.claude`. Serialized via the shared env lock so it can't race sibling
     /// tests that also relocate these variables.
     struct EnvHome {
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -3298,10 +2820,10 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let dir = tempfile::tempdir().unwrap();
             let prev_cs = std::env::var_os("PAPER_CLAUDE_SWITCH_HOME");
-            let prev_ch = std::env::var_os("CODEX_HOME");
+            let prev_ch = std::env::var_os("CLAUDE_CONFIG_DIR");
             unsafe {
                 std::env::set_var("PAPER_CLAUDE_SWITCH_HOME", dir.path());
-                std::env::set_var("CODEX_HOME", dir.path().join("codex"));
+                std::env::set_var("CLAUDE_CONFIG_DIR", dir.path().join("claude"));
             }
             Self {
                 _lock: lock,
@@ -3320,19 +2842,12 @@ mod tests {
                     None => std::env::remove_var("PAPER_CLAUDE_SWITCH_HOME"),
                 }
                 match &self.prev_ch {
-                    Some(v) => std::env::set_var("CODEX_HOME", v),
-                    None => std::env::remove_var("CODEX_HOME"),
+                    Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
                 }
             }
         }
     }
-
-
-
-
-
-
-
 
     #[test]
     fn failed_initial_profile_read_is_visible_and_does_not_start_refresh() {
@@ -3371,107 +2886,6 @@ mod tests {
                 .is_some_and(|message| message.contains("Could not load"))
         );
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    #[test]
-    fn cancelled_batch_counts_the_current_account_as_attempted() {
-        assert_eq!(batch_relogin_not_attempted(3, 1, 0, true), 1);
-        assert_eq!(batch_relogin_not_attempted(3, 1, 1, false), 1);
-    }
-
-    #[tokio::test]
-    async fn completed_batch_login_wins_over_a_simultaneous_cancel() {
-        let result = finish_login_or_cancel(async { Ok("saved") }, async { Ok(()) }).await;
-
-        assert_eq!(result.unwrap(), "saved");
-    }
-
-    #[tokio::test]
-    async fn cancel_stops_an_unfinished_batch_login_round() {
-        let login = std::future::pending::<anyhow::Result<&'static str>>();
-        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
-
-        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
-    }
-
-    #[tokio::test]
-    async fn cancellation_before_workspace_refresh_finishes_does_not_commit_credentials() {
-        let committed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let committed_by_save = committed.clone();
-        let login = finish_refresh_then_commit(std::future::pending(), move || {
-            committed_by_save.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok("saved")
-        });
-
-        let result = finish_login_or_cancel(login, async { Ok(()) }).await;
-
-        assert!(crate::login::is_login_cancelled(&result.unwrap_err()));
-        assert!(!committed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[test]
-    fn model_result_rebuilds_an_open_account_detail() {
-        let mut app = App::new();
-        app.accounts.push(AccountEntry {
-            alias: "account".into(),
-            info: AccountInfo::default(),
-            usage: UsageStatus::Idle,
-            is_current: false,
-        });
-        app.view_indices.push(0);
-        app.model_cache
-            .insert("account".into(), ModelStatus::Loading);
-        let request_id = app.model_next_id;
-        app.model_next_id = app.model_next_id.wrapping_add(1);
-        app.model_requests.insert("account".into(), request_id);
-        app.open_account_menu();
-
-        app.model_sender
-            .try_send((
-                "account".into(),
-                request_id,
-                Ok(vec![ModelEntry {
-                    slug: "official-slug".into(),
-                    display_name: Some("Official Name".into()),
-                    description: Some("Official description".into()),
-                    visibility: Some("list".into()),
-                    supported_in_api: Some(true),
-                    context_window: Some(372_000),
-                    default_reasoning_effort: Some("medium".into()),
-                    supported_reasoning_efforts: vec!["low".into(), "medium".into(), "high".into()],
-                    ..ModelEntry::default()
-                }]),
-            ))
-            .unwrap();
-        app.poll_model_results();
-
-        let Some(super::super::menu::MenuState::Account { info, .. }) = app.menu else {
-            panic!("account detail should remain open");
-        };
-        assert!(info.models.iter().any(|line| {
-            line.trim() == "Official Name · default medium · allowed low, medium, high"
-        }));
-        assert!(!info.models.iter().any(|line| {
-            line.contains("official-slug")
-                || line.contains("visibility=")
-                || line.contains("context=")
-        }));
-    }
-
-
 
     #[tokio::test(flavor = "current_thread")]
     async fn accounts_main_dispatch_wires_u_to_switch_selected() {
@@ -3549,27 +2963,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn model_detail_error_is_not_retried_on_the_next_frame() {
-        let _home = EnvHome::new();
-        let path = crate::profile::profile_auth_path("account").unwrap();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"{}").unwrap();
-
-        let mut app = App::new();
-        app.model_cache.insert(
-            "account".into(),
-            ModelStatus::Error("previous model request failed".into()),
-        );
-
-        app.ensure_models_loaded("account");
-
-        assert!(matches!(
-            app.model_cache.get("account"),
-            Some(ModelStatus::Error(error)) if error == "previous model request failed"
-        ));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn auto_refresh_defers_until_an_account_switch_finishes() {
         let _home = EnvHome::new();
         let path = crate::profile::profile_auth_path("account").unwrap();
@@ -3631,8 +3024,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn usage_result_rebuilds_an_open_account_detail() {
         let mut app = App::new();
@@ -3643,8 +3034,6 @@ mod tests {
             is_current: false,
         });
         app.view_indices.push(0);
-        app.model_cache
-            .insert("account".into(), ModelStatus::Loaded(Vec::new()));
         app.refreshing_requests
             .insert("account".into(), (1, Refresh::Cached));
         app.open_account_menu();
@@ -3660,12 +3049,6 @@ mod tests {
         };
         assert!(info.usage.is_some());
     }
-
-
-
-
-
-
 
     #[test]
     fn stale_usage_result_is_ignored_after_a_new_request_generation_starts() {
@@ -3695,10 +3078,6 @@ mod tests {
         assert!(matches!(app.accounts[0].usage, UsageStatus::Loaded(_)));
         assert_eq!(app.loading_count(), 1);
     }
-
-
-
-
 
     #[test]
     fn forced_follow_up_is_queued_when_usage_request_is_already_in_flight() {
@@ -3759,17 +3138,7 @@ mod tests {
     #[test]
     fn unattended_refresh_refetches_loaded_usage_without_forcing_negative_caches() {
         assert!(refresh_fetches_loaded_usage(Refresh::Unattended));
-        assert!(!refresh_forces_negative_caches(Refresh::Unattended));
-        assert!(refresh_forces_negative_caches(Refresh::Forced));
     }
-
-
-
-
-
-
-
-
 
     #[test]
     fn settings_s_saves_and_accounts_s_still_sorts() {

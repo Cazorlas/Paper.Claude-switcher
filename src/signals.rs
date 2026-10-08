@@ -12,6 +12,8 @@ use anyhow::Result;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShutdownSignal {
     Interrupt,
+    // Sent only on Unix, where SIGTERM exists.
+    #[cfg_attr(not(unix), allow(dead_code))]
     Terminate,
 }
 
@@ -48,6 +50,7 @@ impl ShutdownListener {
     /// than a hardening: tokio's registration is process-wide and permanent, so
     /// after the critical section the command would go on ignoring `kill` for
     /// as long as it lives.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub(crate) fn interrupt_only() -> Result<Self> {
         Self::build(false)
     }
@@ -77,6 +80,7 @@ impl ShutdownListener {
     /// Resolves once a signal has been received. Safe to cancel: the
     /// registration lives in `self`, so a signal that arrives while this future
     /// is not being polled is still observed by the next call.
+    #[cfg_attr(not(all(test, unix)), allow(dead_code))]
     pub(crate) async fn recv(&mut self) {
         let _ = self.recv_signal().await;
     }
@@ -113,7 +117,7 @@ impl ShutdownListener {
 /// A raise is process-wide, so two such tests running on different threads of
 /// the same test binary observe each other's signals. This module and
 /// `commands::launch` both have one, and they compile into the same binary.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) static RAISE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(all(test, unix))]

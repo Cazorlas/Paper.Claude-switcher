@@ -104,7 +104,7 @@ fn launch_dash_dash_exec_json_is_not_an_alias_named_exec() {
     let home = temp_home("dash-dash-exec");
     let fake = install_fake_claude(&home);
 
-    let output = run(&home, &fake, &["launch", "--", "exec", "--json", "review this"]);
+    let output = run(&home, &fake, &["launch", "--", "mcp", "--json", "review this"]);
     let combined = combined(&output);
     assert!(!output.status.success(), "auto-select with no profiles must fail: {combined}");
     assert!(
@@ -120,7 +120,7 @@ fn launch_exec_without_separator_is_not_an_alias() {
     let home = temp_home("exec-not-alias");
     let fake = install_fake_claude(&home);
 
-    let output = run(&home, &fake, &["launch", "exec", "--json", "review this"]);
+    let output = run(&home, &fake, &["launch", "mcp", "--json", "review this"]);
     let combined = combined(&output);
     assert!(!output.status.success(), "auto-select with no profiles must fail: {combined}");
     assert!(
@@ -137,8 +137,8 @@ fn launch_merges_tokens_on_both_sides_of_double_dash() {
     let fake = install_fake_claude(&home);
     write_claude_profile(&home, "work", "work@example.com", "U-work");
 
-    let output = run(&home, &fake, &["launch", "work", "exec", "--", "--json", "hi"]);
+    let output = run(&home, &fake, &["launch", "work", "mcp", "--", "--json", "hi"]);
     assert!(output.status.success(), "{}", combined(&output));
-    assert_eq!(recorded_argv(&fake.1), ["exec", "--json", "hi"]);
+    assert_eq!(recorded_argv(&fake.1), ["mcp", "--json", "hi"]);
     let _ = fs::remove_dir_all(home);
 }

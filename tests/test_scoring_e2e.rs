@@ -1,21 +1,36 @@
 mod mock;
 
-use claude_switch::jwt::AccountInfo;
-use claude_switch::usage::{self, UsageInfo};
+use claude_switch::claude_usage::AccountInfo;
+use claude_switch::usage::{self, UsageInfo, WindowUsage};
 use mock::scenarios;
 
 type CandidateInput = (String, UsageInfo, AccountInfo, i64);
 
-/// Parse a mock usage response into the input consumed by the production
+/// One rate-limit window of a mock response.
+fn window(json: &serde_json::Value, minutes: i64) -> Option<WindowUsage> {
+    Some(WindowUsage {
+        used_percent: json.get("used_percent")?.as_f64(),
+        resets_at: json.get("reset_at").and_then(serde_json::Value::as_i64),
+        window_minutes: Some(minutes),
+    })
+}
+
+/// Turn a mock usage response into the input consumed by the production
 /// `score_candidates` entry point.
 fn candidate_from_json(
     alias: &str,
     json: &serde_json::Value,
-    jwt_plan: Option<&str>,
+    account_plan: Option<&str>,
 ) -> CandidateInput {
-    let usage = usage::parse_usage(json);
+    let limits = &json["rate_limit"];
+    let usage = UsageInfo {
+        primary: window(&limits["primary_window"], 300),
+        secondary: window(&limits["secondary_window"], 10080),
+        plan_type: json["plan_type"].as_str().map(str::to_string),
+        ..UsageInfo::default()
+    };
     let account = AccountInfo {
-        plan_type: jwt_plan.map(str::to_string),
+        plan_type: account_plan.map(str::to_string),
         ..AccountInfo::default()
     };
     (alias.to_string(), usage, account, 0)
@@ -234,7 +249,7 @@ fn team_exhausted_falls_back_to_plus() {
 }
 
 #[test]
-fn api_plan_overrides_stale_jwt_team_claim() {
+fn usage_plan_overrides_a_stale_saved_team_plan() {
     let now = claude_switch::auth::now_unix_secs();
     let response = mock::transformer::base_response("plus", 10.0, 18000, 10.0, 604800);
 

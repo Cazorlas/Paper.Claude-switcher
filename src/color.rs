@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 use owo_colors::OwoColorize;
 
 use crate::cli::ColorMode;
-use crate::jwt::PlanKind;
+use crate::claude_usage::PlanKind;
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
 
@@ -101,32 +101,6 @@ pub fn usage_pct(s: &str, pct: f64) -> String {
         format!("{}", s.yellow())
     } else {
         format!("{}", s.green())
-    }
-}
-
-/// Keep finite credit balances neutral; only zero or negative balances warn.
-pub fn credits(s: &str, balance: f64, unlimited: bool) -> String {
-    if !enabled() {
-        return s.to_string();
-    }
-    if unlimited {
-        format!("{}", s.green())
-    } else if balance <= 0.0 {
-        format!("{}", s.red())
-    } else {
-        s.to_string()
-    }
-}
-
-/// Color a status tag: OK = green, Limited = red, Error = red
-pub fn status_tag(tag: &str) -> String {
-    if !enabled() {
-        return format!("[{tag}]");
-    }
-    match tag {
-        "OK" => format!("[{}]", tag.green()),
-        "Limited" | "Error" => format!("[{}]", tag.red()),
-        _ => format!("[{tag}]"),
     }
 }
 

@@ -24,10 +24,6 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 dirs = "7"
-sha2 = "0.11"
-hex = "0.4"
-base64 = "0.23"
-flate2 = "1"
 semver = "1"
 reqwest = { version = "0.12", features = [
     "json",
@@ -43,26 +39,18 @@ reqwest = { version = "0.12", features = [
     # environment or --proxy) gets connection failures the browser does not.
     "macos-system-configuration",
 ], default-features = false }
-self-replace = "1"
 tempfile = "3"
-webbrowser = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
 ratatui = "0.30"
 crossterm = "0.29"
-urlencoding = "2"
 toml = "1"
-rand = "0.10"
 fs4 = "1.1.0"
 chrono = { version = "0.4", features = ["clock"] }
 supports-color = "3"
 owo-colors = "4"
-tar = "0.4"
-zip = { version = "8", default-features = false, features = ["deflate"] }
 libc = "0.2"
-rpassword = "7"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "=0.61.2", features = [

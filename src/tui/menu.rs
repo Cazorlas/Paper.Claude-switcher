@@ -1,17 +1,17 @@
 /// TUI menu state machines for Phase 2:
 ///   - Account menu (single-account actions)
-///   - Add menu (OAuth flow choice for new account)
-///   - OAuth flow choice (browser vs device code, used by re-login)
+///   - Add menu (save the current Claude Code login as a new account)
+///   - Re-login menu (save the current Claude Code login into an account)
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
 };
 
 use super::popup::{PopupLayout, PopupState, render_popup};
 use super::theme::{
-    C_CYAN, C_GREEN, C_PURPLE, C_RED, C_WHITE, C_YELLOW, DIM, base, dim as dim_style, header, key,
+    C_CYAN, C_GREEN, C_RED, C_WHITE, C_YELLOW, DIM, base, dim as dim_style, header, key,
 };
 use ratatui::crossterm::event::KeyCode;
 
@@ -37,8 +37,6 @@ pub enum MenuState {
     },
     /// Batch menu shown when one or more accounts are marked.
     Batch { count: usize, popup: PopupState },
-    /// Batch re-login flow chooser (browser vs device code).
-    BatchReloginFlow { count: usize, popup: PopupState },
 }
 
 #[derive(Debug, Clone)]
@@ -46,17 +44,12 @@ pub struct AccountMenuInfo {
     pub alias: String,
     pub email: Option<String>,
     pub account_id: Option<String>,
-    pub user_id: Option<String>,
-    pub workspace_name: Option<String>,
-    pub is_fedramp: bool,
     pub plan_label: String,
     pub plan_type: Option<String>,
     pub is_current: bool,
-    pub organizations: Vec<String>,
     pub auth_expiries: Vec<String>,
     pub usage: Option<Box<crate::usage::UsageInfo>>,
     pub usage_meta: Vec<String>,
-    pub models: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,31 +60,24 @@ pub enum MenuAction {
     Close,
     /// Switch to alias.
     Use(String),
-    /// Launch Codex with alias (ChatGPT profile or custom provider).
+    /// Switch to alias, then start Claude Code.
     Launch(String),
     /// Open re-login flow chooser for alias.
     ReloginRequest(String, Option<String>),
     /// Trigger re-login with chosen flow.
     Relogin { alias: String, device: bool },
-    /// Trigger add-new-account with chosen flow.
+    /// Save the current Claude Code login as a new account.
     Add { device: bool },
     /// Refresh usage and model metadata for one account.
     RefreshOne(String),
     /// Open rename input for alias.
     Rename(String),
-    /// Warmup just this alias.
-    /// Consume the earliest-expiring reset card for alias.
     /// Request delete confirmation for alias.
     DeleteRequest(String),
 
     // Batch actions ────────────────────────────
     /// Force-refresh all marked accounts.
     BatchRefresh,
-    /// Warmup all marked accounts.
-    /// Open OAuth flow chooser for batch re-login.
-    BatchReloginRequest,
-    /// Re-login marked accounts sequentially using `device` flow.
-    BatchRelogin { device: bool },
     /// Request batch-delete confirmation.
     BatchDeleteRequest,
 }
@@ -170,42 +156,6 @@ fn quota_window_lines(
         base().fg(DIM),
     ));
     vec![Line::from(spans)]
-}
-
-fn reasoning_style(effort: &str) -> Style {
-    match effort {
-        "low" => base().fg(C_GREEN),
-        "medium" => base().fg(C_CYAN),
-        "high" => base().fg(C_YELLOW),
-        "xhigh" => base().fg(Color::LightMagenta),
-        "max" => base().fg(C_RED),
-        "ultra" => base().fg(C_PURPLE),
-        _ => base().fg(DIM),
-    }
-}
-
-fn model_line_spans(model: &str, label_style: Style) -> Vec<Span<'static>> {
-    let model = model.trim();
-    let Some((name, details)) = model.split_once(" · default ") else {
-        return vec![Span::styled(model.to_string(), label_style)];
-    };
-    let Some((default, allowed)) = details.split_once(" · allowed ") else {
-        return vec![Span::styled(model.to_string(), label_style)];
-    };
-
-    let mut spans = vec![
-        Span::styled(name.to_string(), label_style),
-        Span::styled(" · default ", base().fg(DIM)),
-        Span::styled(default.to_string(), reasoning_style(default)),
-        Span::styled(" · allowed ", base().fg(DIM)),
-    ];
-    for (index, effort) in allowed.split(", ").enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(", ", base().fg(DIM)));
-        }
-        spans.push(Span::styled(effort.to_string(), reasoning_style(effort)));
-    }
-    spans
 }
 
 fn format_duration(seconds: i64) -> String {
@@ -303,13 +253,6 @@ impl MenuState {
         }
     }
 
-    pub fn batch_relogin_flow(count: usize) -> Self {
-        MenuState::BatchReloginFlow {
-            count,
-            popup: PopupState::new(),
-        }
-    }
-
     /// Translate a key press into an action. Returns `Close` to dismiss menu only.
     pub fn handle_key(&mut self, code: ratatui::crossterm::event::KeyCode) -> MenuAction {
         use ratatui::crossterm::event::KeyCode;
@@ -349,33 +292,21 @@ impl MenuState {
             },
             MenuState::Add { .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
-                KeyCode::Char('b') => MenuAction::Add { device: false },
-                KeyCode::Char('d') => MenuAction::Add { device: true },
+                KeyCode::Char('s') | KeyCode::Enter => MenuAction::Add { device: false },
                 _ => MenuAction::Noop,
             },
             MenuState::ReloginFlow { alias, .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
-                KeyCode::Char('b') => MenuAction::Relogin {
+                KeyCode::Char('s') | KeyCode::Enter => MenuAction::Relogin {
                     alias: alias.clone(),
                     device: false,
-                },
-                KeyCode::Char('d') => MenuAction::Relogin {
-                    alias: alias.clone(),
-                    device: true,
                 },
                 _ => MenuAction::Noop,
             },
             MenuState::Batch { .. } => match code {
                 KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
                 KeyCode::Char('r') => MenuAction::BatchRefresh,
-                KeyCode::Char('l') => MenuAction::BatchReloginRequest,
                 KeyCode::Char('d') => MenuAction::BatchDeleteRequest,
-                _ => MenuAction::Noop,
-            },
-            MenuState::BatchReloginFlow { .. } => match code {
-                KeyCode::Esc | KeyCode::Char('q') => MenuAction::Close,
-                KeyCode::Char('b') => MenuAction::BatchRelogin { device: false },
-                KeyCode::Char('d') => MenuAction::BatchRelogin { device: true },
                 _ => MenuAction::Noop,
             },
         }
@@ -418,46 +349,16 @@ impl MenuState {
                         Span::styled(email.clone(), base().fg(C_WHITE)),
                     ]));
                 }
-                if info.workspace_name.is_some() || info.plan_type.is_some() {
+                if let Some(plan_type) = &info.plan_type {
                     left_lines.push(Line::from(vec![
-                        Span::styled("workspace  ", dim),
-                        Span::styled(
-                            info.workspace_name
-                                .clone()
-                                .unwrap_or_else(|| "Personal".into()),
-                            label_style,
-                        ),
-                        Span::styled(
-                            info.plan_type
-                                .as_ref()
-                                .map(|value| format!("  ·  {value}"))
-                                .unwrap_or_default(),
-                            dim,
-                        ),
+                        Span::styled("plan       ", dim),
+                        Span::styled(plan_type.clone(), label_style),
                     ]));
                 }
                 if let Some(account_id) = &info.account_id {
                     left_lines.push(Line::from(vec![
                         Span::styled("account id ", dim),
                         Span::styled(account_id.clone(), dim),
-                    ]));
-                }
-                if let Some(user_id) = &info.user_id {
-                    left_lines.push(Line::from(vec![
-                        Span::styled("user id    ", dim),
-                        Span::styled(user_id.clone(), dim),
-                    ]));
-                }
-                if info.is_fedramp {
-                    left_lines.push(Line::from(vec![
-                        Span::styled("route      ", dim),
-                        Span::styled("FedRAMP", base().fg(C_YELLOW)),
-                    ]));
-                }
-                for organization in &info.organizations {
-                    left_lines.push(Line::from(vec![
-                        Span::styled("organization  ", dim),
-                        Span::styled(organization.clone(), label_style),
                     ]));
                 }
                 for expiry in &info.auth_expiries {
@@ -482,16 +383,6 @@ impl MenuState {
                 left_lines.extend(quota_lines(info.usage.as_deref()));
                 for item in &info.usage_meta {
                     left_lines.push(Line::from(Span::styled(item.clone(), dim)));
-                }
-                left_lines.push(Line::from(""));
-                left_lines.push(Line::from(Span::styled(
-                    format!("Models ({})", info.models.len()),
-                    header_style.add_modifier(Modifier::BOLD),
-                )));
-                for model in &info.models {
-                    let mut spans = vec![Span::styled("● ", base().fg(C_CYAN))];
-                    spans.extend(model_line_spans(model, label_style));
-                    left_lines.push(Line::from(spans));
                 }
                 left_lines.push(Line::from(""));
                 left_lines.push(Line::from(Span::styled(
@@ -559,12 +450,12 @@ impl MenuState {
             }
             MenuState::Add { popup } => {
                 let title = "Add new account";
-                let items = [
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ];
+                let items = [("s", "Save the current Claude Code login")];
                 let mut lines: Vec<Line<'static>> = Vec::new();
-                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
+                lines.push(Line::from(Span::styled(
+                    "Log in to Claude Code first (claude, then /login; do not /logout).",
+                    header_style,
+                )));
                 lines.push(Line::from(""));
                 lines.extend(menu_items(&items, key_style, label_style));
                 lines.push(Line::from(""));
@@ -583,14 +474,14 @@ impl MenuState {
                     Some(e) => format!("{alias}  ({e})"),
                     None => alias.clone(),
                 };
-                let items = [
-                    ("b", "Browser (PKCE, opens local callback)"),
-                    ("d", "Device code (for headless / no browser)"),
-                ];
+                let items = [("s", "Save the current Claude Code login into this account")];
                 let mut lines: Vec<Line<'static>> =
                     vec![Line::from(Span::styled(header, header_style))];
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Choose OAuth flow:", header_style)));
+                lines.push(Line::from(Span::styled(
+                    "In Claude Code, run /login with this account first.",
+                    header_style,
+                )));
                 lines.push(Line::from(""));
                 lines.extend(menu_items(&items, key_style, label_style));
                 lines.push(Line::from(""));
@@ -605,8 +496,6 @@ impl MenuState {
                 let header = format!("{count} account(s) marked");
                 let items = [
                     ("r", "Refresh selected"),
-                    ("w", "Warmup selected"),
-                    ("l", "Re-login selected (sequential)"),
                     ("d", "Delete selected"),
                 ];
                 let mut lines: Vec<Line<'static>> = Vec::new();
@@ -618,27 +507,6 @@ impl MenuState {
                 render_popup(f, title, &lines, popup, area).map(|layout| MenuRender {
                     panel: layout.panel,
                     actions: hits_for_menu_items(&layout, 2, &items),
-                })
-            }
-            MenuState::BatchReloginFlow { count, popup } => {
-                let items = [("b", "Browser (PKCE)"), ("d", "Device code")];
-                let mut lines: Vec<Line<'static>> = Vec::new();
-                lines.push(Line::from(Span::styled(
-                    format!("{count} account(s) marked"),
-                    header_style,
-                )));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "Sequential re-login. Browser uses local port 1455 each round.",
-                    base().fg(DIM),
-                )));
-                lines.push(Line::from(""));
-                lines.extend(menu_items(&items, key_style, label_style));
-                lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("esc / q to cancel", dim)));
-                render_popup(f, "Batch re-login", &lines, popup, area).map(|layout| MenuRender {
-                    panel: layout.panel,
-                    actions: hits_for_menu_items(&layout, 4, &items),
                 })
             }
         }
@@ -683,11 +551,10 @@ fn menu_items(items: &[(&str, &str)], key_style: Style, label_style: Style) -> V
 
 #[cfg(test)]
 mod tests {
-    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode, style::Color};
+    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyCode};
 
     use super::{
-        AccountMenuInfo, C_CYAN, C_GREEN, C_PURPLE, C_RED, C_YELLOW, MenuAction,
-        MenuState, model_line_spans, quota_lines,
+        AccountMenuInfo, MenuAction, MenuState, quota_lines,
     };
     use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
@@ -710,50 +577,18 @@ mod tests {
         None
     }
 
-
-
-
-
-
-
-    fn account_menu_with_usage(usage: UsageInfo) -> MenuState {
-        MenuState::account(AccountMenuInfo {
-            alias: "account".into(),
-            email: None,
-            account_id: None,
-            user_id: None,
-            workspace_name: None,
-            is_fedramp: false,
-            plan_label: "Pro".into(),
-            plan_type: Some("pro".into()),
-            is_current: true,
-            organizations: Vec::new(),
-            auth_expiries: Vec::new(),
-            usage: Some(Box::new(usage)),
-            usage_meta: Vec::new(),
-            models: Vec::new(),
-        })
-    }
-
-
-
     #[test]
     fn account_menu_launch_action() {
         let mut menu = MenuState::account(AccountMenuInfo {
             alias: "work".into(),
             email: None,
             account_id: None,
-            user_id: None,
-            workspace_name: None,
-            is_fedramp: false,
             plan_label: "Unknown".into(),
             plan_type: None,
             is_current: false,
-            organizations: Vec::new(),
             auth_expiries: Vec::new(),
             usage: None,
             usage_meta: Vec::new(),
-            models: Vec::new(),
         });
         assert!(matches!(
             menu.handle_key(KeyCode::Char('o')),
@@ -776,17 +611,12 @@ mod tests {
             alias: "account".into(),
             email: None,
             account_id: None,
-            user_id: None,
-            workspace_name: None,
-            is_fedramp: false,
             plan_label: "Unknown".into(),
             plan_type: None,
             is_current: false,
-            organizations: Vec::new(),
             auth_expiries: Vec::new(),
             usage: None,
             usage_meta: Vec::new(),
-            models: Vec::new(),
         });
 
         assert!(matches!(menu.handle_key(KeyCode::Down), MenuAction::Noop));
@@ -795,8 +625,6 @@ mod tests {
         };
         assert_eq!(popup.scroll, 1);
     }
-
-
 
     #[test]
     fn quota_visuals_include_main_and_future_model_pools() {
@@ -809,8 +637,8 @@ mod tests {
         let usage = UsageInfo {
             primary: Some(window.clone()),
             additional_limits: vec![AdditionalRateLimit {
-                limit_name: Some("GPT-6-Codex-Burst".to_string()),
-                metered_feature: Some("codex_futureburst".to_string()),
+                limit_name: Some("Sonnet-Burst".to_string()),
+                metered_feature: Some("future_burst".to_string()),
                 primary: Some(window),
                 ..Default::default()
             }],
@@ -823,7 +651,7 @@ mod tests {
             .join("\n");
 
         assert!(text.contains("Main"));
-        assert!(text.contains("GPT-6-Codex-Burst"));
+        assert!(text.contains("Sonnet-Burst"));
         assert!(text.contains('█'));
         assert!(text.contains('┃'));
         assert!(text.contains("20% left"));
@@ -834,28 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn model_reasoning_efforts_use_semantic_colors() {
-        let spans = model_line_spans(
-            "GPT-5.6-Sol · default medium · allowed low, medium, high, xhigh, max, ultra",
-            super::base(),
-        );
-        let color_for = |effort: &str| {
-            spans
-                .iter()
-                .find(|span| span.content == effort)
-                .and_then(|span| span.style.fg)
-        };
-
-        assert_eq!(color_for("low"), Some(C_GREEN));
-        assert_eq!(color_for("medium"), Some(C_CYAN));
-        assert_eq!(color_for("high"), Some(C_YELLOW));
-        assert_eq!(color_for("xhigh"), Some(Color::LightMagenta));
-        assert_eq!(color_for("max"), Some(C_RED));
-        assert_eq!(color_for("ultra"), Some(C_PURPLE));
-    }
-
-    #[test]
-    fn realistic_account_detail_keeps_models_in_the_single_column() {
+    fn realistic_account_detail_renders_quota_pools() {
         let now = crate::auth::now_unix_secs();
         let window = WindowUsage {
             used_percent: Some(50.0),
@@ -866,7 +673,7 @@ mod tests {
             primary: Some(window.clone()),
             secondary: Some(window.clone()),
             additional_limits: vec![AdditionalRateLimit {
-                limit_name: Some("GPT-5.3-Codex-Spark".into()),
+                limit_name: Some("Sonnet".into()),
                 primary: Some(window.clone()),
                 secondary: Some(window),
                 ..Default::default()
@@ -877,20 +684,12 @@ mod tests {
             alias: "account".into(),
             email: Some("account@example.com".into()),
             account_id: Some("account-id".into()),
-            user_id: Some("user-id".into()),
-            workspace_name: Some("Night City".into()),
-            is_fedramp: false,
-            plan_label: "Pro 20×".into(),
-            plan_type: Some("pro".into()),
+            plan_label: "Max".into(),
+            plan_type: Some("max".into()),
             is_current: true,
-            organizations: vec!["Night City · Owner · default workspace".into()],
-            auth_expiries: vec![
-                "ID token · expires soon".into(),
-                "Access token · expires soon".into(),
-            ],
+            auth_expiries: vec!["Access token · expires soon".into()],
             usage: Some(Box::new(usage)),
             usage_meta: vec!["  updated now".into()],
-            models: vec!["  Official Model".into(), "    Official description".into()],
         });
         let backend = TestBackend::new(160, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -901,7 +700,7 @@ mod tests {
             })
             .unwrap();
 
-        let models = find_text(terminal.backend(), "Models").expect("models heading");
-        assert!(models.0 < 80, "models should follow the account details");
+        let pools = find_text(terminal.backend(), "Quota pools").expect("quota heading");
+        assert!(pools.0 < 80, "quota pools should follow the account details");
     }
 }

@@ -1,31 +1,7 @@
-// The Codex usage/refresh code below is dead until the next task removes it.
-#![allow(dead_code)]
-
-use std::time::Duration;
-
 use serde::{Deserialize, Serialize};
 
-mod api;
-mod parse;
-pub(crate) mod models;
 mod scoring;
 
-pub(crate) use api::{
-    apply_account_routing_headers, refresh_profile_tokens, reload_profile_tokens_if_changed,
-};
-pub use api::{
-    fetch_usage_retried, fetch_usage_retried_force, fetch_usage_retried_unattended,
-    refresh_expiring_tokens, validate_import_auth,
-};
-// Re-exported for the lib target's public API (used by integration tests via
-// `claude_switch::usage::X`); the binary target doesn't call these through this
-// path itself, so they'd otherwise look unused there.
-#[allow(unused_imports)]
-pub use api::fetch_usage_with_refresh;
-#[allow(unused_imports)]
-pub use api::refresh_expiring_tokens_within;
-#[allow(unused_imports)]
-pub use parse::parse_usage;
 pub use scoring::{
     is_available, is_candidate_eligible, pace_percent, score_candidates, visible_pace_percent,
 };
@@ -49,8 +25,8 @@ pub struct SpendControlLimit {
     pub resets_at: Option<i64>,
 }
 
-/// One entry from the `additional_rate_limits` array in the usage API response.
-/// Represents a metered feature (e.g. `codex_other`) with its own independent windows.
+/// One extra rate-limit pool (for example a per-model weekly limit) with its
+/// own independent windows.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AdditionalRateLimit {
     pub limit_name: Option<String>,
@@ -68,14 +44,6 @@ pub struct ResetCredit {
     pub expires_at: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConsumedResetCredit {
-    pub credit: ResetCredit,
-    pub code: Option<String>,
-    pub windows_reset: Option<u64>,
-    pub redeemed_at: Option<String>,
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct UsageInfo {
     pub fetched_at: Option<i64>,
@@ -83,18 +51,18 @@ pub struct UsageInfo {
     pub secondary: Option<WindowUsage>, // 7d window
     pub credits_balance: Option<f64>,
     pub unlimited_credits: Option<bool>,
-    /// plan_type from usage API response (authoritative; overrides JWT claims when present)
+    /// plan type reported with the usage (authoritative when present)
     pub plan_type: Option<String>,
     pub reset_credits_available_count: Option<u64>,
     pub reset_credits: Vec<ResetCredit>,
     pub reset_credits_error: Option<String>,
-    /// Explicit account/workspace-level restriction reported by the API.
+    /// Explicit account-level restriction reported by the API.
     pub account_limited: bool,
     /// Backend-classified limit reason, preserved for detailed diagnostics.
     pub rate_limit_reached_type: Option<String>,
-    /// Effective workspace/user spend-control limit, when supplied by the backend.
+    /// Effective spend-control limit, when supplied by the backend.
     pub individual_limit: Option<Box<SpendControlLimit>>,
-    /// Per-feature rate limits from `additional_rate_limits[]` (e.g. codex_other).
+    /// Per-model rate limits.
     pub additional_limits: Vec<AdditionalRateLimit>,
 }
 
@@ -111,7 +79,7 @@ pub struct PoolRow {
 }
 
 /// Assemble display rows from the raw `additional_limits` array. Returns an
-/// empty vec when there are no additional pools (the common case today).
+/// empty vec when there are no additional pools.
 pub fn additional_pool_rows(limits: &[AdditionalRateLimit]) -> Vec<PoolRow> {
     limits
         .iter()
@@ -217,142 +185,36 @@ pub const WINDOW_7D_SECS: i64 = 7 * 86400;
 /// Free plan accounts become ineligible below this 5h remaining%.
 pub const FREE_FLOOR_PCT: f64 = 35.0;
 
-
-const MAX_RETRIES: u32 = 3;
-const RETRY_DELAY: Duration = Duration::from_secs(1);
-
 /// How much of the cache a usage fetch may skip.
-///
-/// One boolean used to cover two unrelated requests: wanting numbers that are
-/// not stale, and wanting a verdict the auth server has already given to be
-/// asked again. Only a person can mean the second — an unattended timer that
-/// re-presents a spent credential every polling interval learns nothing and
-/// pays for the rejection every time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refresh {
     /// Serve a fresh cache entry as-is. Everyday reads.
     Cached,
-    /// Ignore the usage TTL, but honour a recorded auth verdict. What a timer
-    /// with nobody watching wants.
+    /// Ignore the usage TTL. What a timer with nobody watching wants.
     Unattended,
-    /// Ignore both. Reserved for a person explicitly asking again, and the only
-    /// way back from a verdict recorded in error.
+    /// A person explicitly asking again.
     Forced,
 }
 
-impl Refresh {
-    pub(super) fn skips_usage_cache(self) -> bool {
-        !matches!(self, Refresh::Cached)
-    }
-
-    pub(super) fn may_re_present_a_rejected_credential(self) -> bool {
-        matches!(self, Refresh::Forced)
-    }
+/// Claude usage for a saved profile, served from the usage cache when fresh.
+/// The active account is read with its live token and never refreshed here.
+pub async fn fetch_usage_retried(alias: &str) -> std::result::Result<UsageInfo, UsageError> {
+    crate::claude_usage::fetch_alias(alias, false).await
 }
 
-pub struct RefreshedTokens {
-    pub id_token: String,
-    pub access_token: String,
-    pub refresh_token: String,
+/// Bypass the usage TTL for current numbers. Used by background refreshes.
+pub async fn fetch_usage_retried_unattended(
+    alias: &str,
+) -> std::result::Result<UsageInfo, UsageError> {
+    crate::claude_usage::fetch_alias(alias, true).await
 }
 
-/// Credentials currently stored for a profile. Kept separate from
-/// `RefreshedTokens` because the existing auth file may not have an id or
-/// refresh token yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProfileTokens {
-    pub id_token: Option<String>,
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub account_id: Option<String>,
-    pub email: Option<String>,
-    pub is_fedramp: bool,
-}
-
-/// A refresh the auth server rejected outright (bad/consumed credential).
-///
-/// OpenAI rotates `refresh_token` on every use and answers replays with
-/// `refresh_token_reused`, so retrying such a failure can never succeed — it
-/// only burns round trips. Carried as a typed error so retry loops can
-/// recognise it via `anyhow::Error::downcast_ref`.
-#[derive(Debug, Clone)]
-pub struct TerminalAuthError {
-    /// Server-provided error code (or `http_<status>` when the body had none).
-    pub code: String,
-    /// Server-provided human-readable message, when present.
-    pub message: Option<String>,
-}
-
-impl TerminalAuthError {
-    /// Short, actionable line for list/TUI status columns.
-    pub fn summary(&self) -> String {
-        format!("re-login required ({})", self.code)
-    }
-}
-
-impl std::fmt::Display for TerminalAuthError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "token refresh rejected, sign in again — {}", self.code)?;
-        if let Some(message) = &self.message {
-            write!(f, ": {message}")?;
-        }
-        Ok(())
-    }
-}
-
-impl std::error::Error for TerminalAuthError {}
-
-/// The server issued or the profile already adopted credentials that do not
-/// match the caller's expected account, or a rotated credential could not be
-/// safely persisted. Callers must abort instead of degrading to old tokens.
-#[derive(Debug)]
-pub(crate) struct RefreshSafetyError {
-    detail: String,
-}
-
-impl RefreshSafetyError {
-    pub(crate) fn new(detail: impl Into<String>) -> Self {
-        Self {
-            detail: detail.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for RefreshSafetyError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.detail)
-    }
-}
-
-impl std::error::Error for RefreshSafetyError {}
-
-pub(crate) fn is_refresh_safety_error(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<RefreshSafetyError>().is_some()
-}
-
-/// Outcome of one usage fetch attempt.
-///
-/// `refreshed` is populated whenever the auth server issued new tokens during
-/// the attempt — **including when `result` is an error**. The rotated
-/// `refresh_token` is the only one the server will still accept, so callers
-/// must persist it before propagating the failure.
-pub struct UsageFetchOutcome {
-    pub refreshed: Option<RefreshedTokens>,
-    pub result: anyhow::Result<UsageInfo>,
-}
-
-/// Outcome of validating an auth.json on the `import` path.
-///
-/// Same split as [`UsageFetchOutcome`], and for the same reason: validation
-/// refreshes the credential before it calls the usage API, so `refreshed` is
-/// populated **even when `result` is an error**. `import` owns a local copy of
-/// the auth value, so returning only the error would drop the single credential
-/// the auth server still accepts and brick the account being imported.
-pub struct ImportValidation {
-    pub refreshed: Option<RefreshedTokens>,
-    /// Account id that the Usage API accepted for these credentials.
-    pub validated_account_id: Option<String>,
-    pub result: anyhow::Result<UsageInfo>,
+/// Bypass every cache. For a person explicitly asking again, or a decision
+/// that must not run on stale numbers.
+pub async fn fetch_usage_retried_force(
+    alias: &str,
+) -> std::result::Result<UsageInfo, UsageError> {
+    crate::claude_usage::fetch_alias(alias, true).await
 }
 
 /// Structured error for usage fetch failures.
@@ -360,41 +222,8 @@ pub struct ImportValidation {
 pub struct UsageError {
     /// Short summary for user-facing display (e.g. "HTTP 401 Unauthorized")
     pub summary: String,
-    /// Full detail for debug/log (e.g. "Usage API failed (HTTP 401), token refresh also failed: ...")
+    /// Full detail for debug/log
     pub detail: String,
-}
-
-impl UsageError {
-    /// The auth server issued rotated credentials but they could not be written
-    /// to disk.
-    ///
-    /// This is *not* a rejected refresh: the new tokens are valid, they simply
-    /// never reached the profile, while the previous `refresh_token` is already
-    /// dead server-side. Continuing would leave the user with an account that
-    /// silently stops working at the next start, so the wording has to point at
-    /// the local write failure and carry the underlying IO/permission cause.
-    pub fn token_persist_failed(alias: &str, cause: &anyhow::Error) -> Self {
-        Self {
-            summary: "refreshed token not saved".to_string(),
-            detail: format!(
-                "[{alias}] token refresh succeeded but the rotated credentials could not be saved: \
-                 {cause:#}. The auth server has already invalidated the previous refresh token, so \
-                 this profile may need to sign in again once the write problem is fixed."
-            ),
-        }
-    }
-}
-
-/// One profile whose rotated credentials could not be written to disk during an
-/// opportunistic refresh.
-///
-/// Opportunistic refresh is a batch, so a single failure must neither abort
-/// the remaining profiles nor disappear into a log line: it is collected and
-/// handed back for the caller to surface.
-#[derive(Debug, Clone)]
-pub struct TokenPersistFailure {
-    pub alias: String,
-    pub error: UsageError,
 }
 
 impl std::fmt::Display for UsageError {
@@ -422,8 +251,8 @@ mod pool_row_tests {
     #[test]
     fn pool_with_both_windows_produces_one_row() {
         let limits = vec![AdditionalRateLimit {
-            limit_name: Some("GPT-5.3-Codex-Spark".to_string()),
-            metered_feature: Some("codex_other".to_string()),
+            limit_name: Some("Sonnet".to_string()),
+            metered_feature: None,
             allowed: Some(true),
             limit_reached: Some(false),
             primary: Some(WindowUsage {
@@ -440,7 +269,7 @@ mod pool_row_tests {
 
         let rows = additional_pool_rows(&limits);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].limit_name, "GPT-5.3-Codex-Spark");
+        assert_eq!(rows[0].limit_name, "Sonnet");
         assert!(!rows[0].unavailable);
         assert_eq!(rows[0].primary.as_ref().unwrap().used_percent, Some(42.0));
         assert_eq!(rows[0].secondary.as_ref().unwrap().used_percent, Some(10.0));

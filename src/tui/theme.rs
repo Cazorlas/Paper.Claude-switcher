@@ -15,7 +15,6 @@ pub const C_CYAN: Color = Color::Rgb(100, 210, 255);
 pub const C_MAGENTA: Color = Color::Rgb(220, 130, 255);
 pub const C_BLUE: Color = Color::Rgb(80, 140, 220);
 pub const C_HIGHLIGHT_BG: Color = Color::Rgb(55, 55, 65);
-pub const C_PURPLE: Color = Color::Rgb(175, 120, 240);
 
 pub fn base() -> Style {
     Style::default().bg(BG).fg(C_WHITE)

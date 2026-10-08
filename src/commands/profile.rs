@@ -4,13 +4,12 @@ use crate::claude_usage;
 use crate::output::{
     self, ProgressReporter, account_to_json, print_json, usage_to_json, user_println,
 };
-use crate::{auth, cache, color, config, jwt, profile, usage};
+use crate::{auth, cache, color, config, profile, usage};
 use anyhow::{Context, Result};
 
 /// The live Claude login and the saved profiles, with the active profile
 /// resolved by account uuid.
 struct Accounts {
-    paths: claude_store::ClaudePaths,
     live: Option<LiveAccount>,
     profiles: Vec<claude_usage::Profile>,
     active: Option<String>,
@@ -30,7 +29,7 @@ impl Accounts {
                 }
             }
         }
-        Ok(Self { paths, live, profiles, active })
+        Ok(Self { live, profiles, active })
     }
 
     fn live_oauth(&self) -> Option<&LiveAccount> {
@@ -277,7 +276,7 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
 /// Score and order candidates: eligible first, then by score, least recently
 /// used, and alias.
 pub(crate) fn rank_candidates(
-    items: Vec<(String, usage::UsageInfo, jwt::AccountInfo, i64)>,
+    items: Vec<(String, usage::UsageInfo, claude_usage::AccountInfo, i64)>,
     now: i64,
     safety_7d: f64,
     team_priority: bool,

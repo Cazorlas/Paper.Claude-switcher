@@ -64,11 +64,121 @@ fn usage_error(error: ApiError) -> UsageError {
     UsageError { summary, detail: format!("Claude usage: {error:?}") }
 }
 
+/// Identity of a saved Claude account, read from the profile's account.json
+/// and credentials.json.
+#[derive(Debug, Default, Clone)]
+pub struct AccountInfo {
+    pub email: Option<String>,
+    pub plan_type: Option<String>,
+    pub account_id: Option<String>,
+    pub workspace_name: Option<String>,
+    /// End of the current paid period (unix seconds), when known.
+    pub subscription_until: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanKind {
+    Free,
+    Go,
+    Plus,
+    ProLite,
+    Pro,
+    Team,
+    Business,
+    Enterprise,
+    Edu,
+    Unknown,
+}
+
+impl PlanKind {
+    pub fn from_wire(plan_type: Option<&str>) -> Self {
+        match plan_type {
+            Some("free") => Self::Free,
+            Some("go") => Self::Go,
+            Some("plus") => Self::Plus,
+            Some("prolite") => Self::ProLite,
+            Some("pro") => Self::Pro,
+            Some("team") => Self::Team,
+            Some("self_serve_business_usage_based" | "business") => Self::Business,
+            Some("enterprise_cbp_usage_based" | "enterprise") => Self::Enterprise,
+            Some("education" | "edu") => Self::Edu,
+            _ => Self::Unknown,
+        }
+    }
+
+    fn display_name(self, raw: Option<&str>) -> String {
+        match self {
+            Self::Free => "Free".to_string(),
+            Self::Go => "Go".to_string(),
+            Self::Plus => "Plus".to_string(),
+            Self::ProLite => "Pro 5×".to_string(),
+            Self::Pro => "Pro 20×".to_string(),
+            Self::Team => "Team".to_string(),
+            Self::Business => "Business".to_string(),
+            Self::Enterprise => "Enterprise".to_string(),
+            Self::Edu => "Edu".to_string(),
+            Self::Unknown => raw.unwrap_or("?").to_string(),
+        }
+    }
+}
+
+impl AccountInfo {
+    pub fn plan_label(&self) -> String {
+        self.plan_label_with(self.plan_type.as_deref())
+    }
+
+    /// Same as `plan_label` but with an overridden plan type (e.g. from API response).
+    pub fn plan_label_with(&self, plan_type: Option<&str>) -> String {
+        let base = PlanKind::from_wire(plan_type).display_name(plan_type);
+        if let Some(name) = &self.workspace_name
+            && !name.is_empty()
+        {
+            return format!("{base} - {name}");
+        }
+        base
+    }
+
+    pub fn is_free(&self) -> bool {
+        matches!(self.plan_type.as_deref(), Some("free") | None)
+    }
+
+    pub fn is_team(&self) -> bool {
+        matches!(self.plan_type.as_deref(), Some("team")) || self.workspace_name.is_some()
+    }
+}
+
+/// How close the end of the paid period is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpiryLevel {
+    Unknown,
+    Ok,
+    /// Ends within a week.
+    Soon,
+    /// The recorded end is in the past.
+    Past,
+}
+
+/// Short text for a table cell, e.g. `10-11 (5d)`, plus its urgency.
+pub fn subscription_label(until: Option<i64>, now: i64) -> (String, ExpiryLevel) {
+    let Some(until) = until else {
+        return ("--".into(), ExpiryLevel::Unknown);
+    };
+    if until <= now {
+        return ("lapsed?".into(), ExpiryLevel::Past);
+    }
+    let days = (until - now + 86_399) / 86_400;
+    let date = chrono::DateTime::from_timestamp(until, 0)
+        .map(|utc| utc.with_timezone(&chrono::Local).format("%m-%d").to_string())
+        .unwrap_or_else(|| "--".into());
+    let level = if days <= 7 { ExpiryLevel::Soon } else { ExpiryLevel::Ok };
+    (format!("{date} ({days}d)"), level)
+}
+
 #[derive(Clone)]
 pub struct Profile {
     pub alias: String,
     pub dir: PathBuf,
-    pub info: crate::jwt::AccountInfo,
+    pub info: AccountInfo,
 }
 
 /// Saved profiles in `list` order. A profile that cannot be read is skipped
@@ -99,7 +209,7 @@ pub fn read_profile(alias: &str) -> Result<Profile> {
     Ok(Profile {
         alias: alias.to_owned(),
         dir,
-        info: crate::jwt::AccountInfo {
+        info: AccountInfo {
             email: account["emailAddress"].as_str().map(str::to_owned),
             account_id: Some(
                 account["accountUuid"]
@@ -214,6 +324,21 @@ pub async fn fetch(
     } else {
         None
     };
+    // Another process may have switched to this profile between the caller's
+    // "inactive" decision and the lock: re-read the live login now and, when it
+    // is this account, read it with the live token instead of refreshing.
+    let rechecked = match (&_refresh_lock, live_oauth) {
+        (Some(_), None) => paths()
+            .and_then(|paths| claude_store::read_live(&paths))
+            .map_err(|e| UsageError {
+                summary: "Claude login unreadable".into(),
+                detail: format!("{e:#}"),
+            })?
+            .filter(|live| profile.info.account_id.as_deref() == Some(live.account_uuid.as_str()))
+            .map(|live| live.oauth),
+        _ => None,
+    };
+    let live_oauth = live_oauth.or(rechecked.as_ref());
     let raw = crate::claude_api::usage_for_profile(
         &client,
         &endpoints(),

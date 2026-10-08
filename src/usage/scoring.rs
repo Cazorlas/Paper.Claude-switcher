@@ -274,7 +274,7 @@ pub fn score_unified(c: &Candidate, safety_margin_7d: f64) -> f64 {
 /// `pool_exhausted` counts 5h-exhausted accounts across the whole input.
 /// Input order is preserved.
 pub fn score_candidates(
-    fetched: Vec<(String, UsageInfo, crate::jwt::AccountInfo, i64)>,
+    fetched: Vec<(String, UsageInfo, crate::claude_usage::AccountInfo, i64)>,
     now: i64,
     safety_7d: f64,
     team_priority: bool,
@@ -445,7 +445,7 @@ mod tests {
     #[test]
     fn test_score_candidates_api_plan_overrides_jwt_and_counts_pool_exhausted() {
         let now = 1_000_000i64;
-        let jwt_team = crate::jwt::AccountInfo {
+        let jwt_team = crate::claude_usage::AccountInfo {
             plan_type: Some("team".to_string()),
             ..Default::default()
         };

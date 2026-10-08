@@ -16,16 +16,6 @@ use super::theme::{BG, C_RED, base, dim, header};
 const MIN_TERM_W: u16 = 20;
 const MIN_TERM_H: u16 = 6;
 
-/// Inner line count of a popup that fills `screen` (2-row margin, 2-row border).
-/// Returns 0 when the screen is below the popup minimum.
-pub fn max_inner_height(screen: Rect) -> u16 {
-    if screen.width < MIN_TERM_W || screen.height < MIN_TERM_H {
-        return 0;
-    }
-    let max_h = screen.height.saturating_sub(2).max(MIN_TERM_H);
-    max_h.saturating_sub(2)
-}
-
 pub struct PopupState {
     pub scroll: u16,
 }
@@ -96,16 +86,6 @@ impl PopupLayout {
         })
     }
 
-    pub fn push_line_hits<T: Copy>(&self, out: &mut Vec<(Rect, T)>, hits: &[Option<T>]) {
-        for (index, hit) in hits.iter().enumerate() {
-            let Some(hit) = *hit else {
-                continue;
-            };
-            if let Some(area) = self.line_rect(index) {
-                out.push((area, hit));
-            }
-        }
-    }
 }
 
 /// Returns popup layout for mouse hit-testing, or `None` when the terminal is
@@ -322,14 +302,6 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
-    }
-
-    #[test]
-    fn max_inner_height_matches_render_popup_layout() {
-        assert_eq!(max_inner_height(Rect::new(0, 0, 80, 24)), 20);
-        assert_eq!(max_inner_height(Rect::new(0, 0, 80, 12)), 8);
-        assert_eq!(max_inner_height(Rect::new(0, 0, 80, 6)), 4);
-        assert_eq!(max_inner_height(Rect::new(0, 0, 10, 24)), 0);
     }
 
     #[test]

@@ -5,11 +5,8 @@ pub enum CsError {
     #[error("profile '{0}' not found")]
     NotFound(String),
 
-    #[error("no auth.json found at {0}")]
+    #[error("no credentials file found at {0}")]
     NoAuthFile(String),
-
-    #[error("operation aborted by user")]
-    Aborted,
 
     #[error("cannot delete the active profile '{0}'")]
     ActiveProfileDelete(String),

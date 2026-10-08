@@ -6,7 +6,7 @@ use anyhow::Error;
 use chrono::{DateTime, Local, TimeZone, Utc};
 use serde::Serialize;
 
-use crate::jwt::AccountInfo;
+use crate::claude_usage::AccountInfo;
 use crate::usage::{AdditionalRateLimit, UsageInfo, WindowUsage};
 
 /// Marker error: the command already printed a user-facing failure message.
@@ -62,8 +62,6 @@ pub struct JsonAdditionalLimit {
     pub secondary: Option<Box<JsonWindow>>,
 }
 
-
-
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum JsonUsage {
@@ -116,48 +114,6 @@ pub struct JsonError {
     pub error: String,
 }
 
-#[derive(Serialize)]
-pub struct JsonImportEntry {
-    pub source: String,
-    pub alias: String,
-    pub action: String,
-    pub account: JsonAccount,
-    pub usage: JsonUsage,
-}
-
-#[derive(Serialize)]
-pub struct JsonImportFailure {
-    pub source: String,
-    pub stage: String,
-    pub error: String,
-}
-
-#[derive(Serialize)]
-pub struct JsonImportReport {
-    pub ok: bool,
-    /// True when at least one skipped file had already had its one-time-use
-    /// `refresh_token` rotated by the auth server and it could not be saved
-    /// anywhere (`token_rotation_lost`). That account needs a fresh login.
-    /// Kept as its own top-level field (rather than folded into `ok`) so a
-    /// consumer checking only `ok`/`imported`/`skipped` for shape keeps
-    /// working, while one that also checks this field can't miss the loss
-    /// behind an otherwise-successful `ok: true` directory import.
-    pub credentials_lost: bool,
-    pub imported: Vec<JsonImportEntry>,
-    pub skipped: Vec<JsonImportFailure>,
-}
-
-#[derive(Serialize)]
-pub struct JsonSelfUpdate {
-    pub ok: bool,
-    pub current_version: String,
-    pub latest_version: String,
-    pub update_available: bool,
-    pub updated: bool,
-    pub install_source: String,
-    pub action: String,
-}
-
 // ── Conversion helpers ───────────────────────────────────
 
 pub fn account_to_json(info: &AccountInfo, api_plan: Option<&str>) -> JsonAccount {
@@ -186,8 +142,6 @@ fn window_to_json(w: &WindowUsage, label: &str, window_secs: i64) -> JsonWindow 
         over_pace: pace.map(|p| used > p),
     }
 }
-
-
 
 fn additional_limit_to_json(l: &AdditionalRateLimit) -> JsonAdditionalLimit {
     JsonAdditionalLimit {
@@ -323,23 +277,6 @@ pub fn format_token_expiry(ts: i64) -> String {
     }
 }
 
-pub fn format_local_datetime(value: &str) -> String {
-    DateTime::parse_from_rfc3339(value)
-        .map(|dt| {
-            let local = dt.with_timezone(&Local);
-            local.format("%Y-%m-%d %H:%M %:z").to_string()
-        })
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-
-
-
-
-
-
-
-
 // ── Output ───────────────────────────────────────────────
 
 static JSON_PRETTY: OnceLock<bool> = OnceLock::new();
@@ -395,20 +332,6 @@ pub fn print_error(msg: &str) {
         error: msg.to_string(),
     };
     println!("{}", serialize(&e));
-}
-
-pub fn user_print(msg: &str) {
-    match message_mode() {
-        MessageMode::Stdout => {
-            print!("{msg}");
-            let _ = io::stdout().flush();
-        }
-        MessageMode::Stderr => {
-            eprint!("{msg}");
-            let _ = io::stderr().flush();
-        }
-        MessageMode::Silent => {}
-    }
 }
 
 pub fn user_println(msg: &str) {
@@ -502,8 +425,6 @@ mod tests {
         assert!(should_report_error(&anyhow::anyhow!("new failure")));
     }
 
-
-
     #[test]
     fn local_timestamp_includes_date_time_and_system_offset() {
         let rendered = format_local_timestamp(1_783_857_600);
@@ -516,19 +437,6 @@ mod tests {
 
         assert_eq!(rendered, expected);
         assert!(!rendered.ends_with('Z'));
-    }
-
-    #[test]
-    fn rfc3339_detail_date_is_converted_to_system_timezone() {
-        let rendered = format_local_datetime("2026-07-20T08:00:00Z");
-        let expected = DateTime::parse_from_rfc3339("2026-07-20T08:00:00Z")
-            .unwrap()
-            .with_timezone(&Local)
-            .format("%Y-%m-%d %H:%M %:z")
-            .to_string();
-
-        assert_eq!(rendered, expected);
-        assert_eq!(format_local_datetime("not-a-date"), "unknown");
     }
 
     #[test]

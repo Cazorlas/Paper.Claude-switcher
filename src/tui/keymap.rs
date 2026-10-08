@@ -5,7 +5,7 @@
 ///
 /// Binding rules (letter must match the verb shown in the UI):
 /// - Same action uses the same key on every tab.
-/// - `o` launches Codex. `l` is re-login on Accounts (and batch). Never bind
+/// - `o` launches Claude Code. `l` is re-login on Accounts (and batch). Never bind
 ///   launch to `l`: that letter already means login.
 /// - Enter opens the selected row (Accounts: action menu, Providers: launch
 ///   picker). `e` edits a provider. In a dialog, Enter confirms and Esc cancels.
@@ -102,7 +102,7 @@ pub const KEYMAP: &[Binding] = &[
     Binding {
         keys: "o",
         section: Section::Account,
-        label: "launch Codex",
+        label: "launch Claude Code",
         in_status_bar: true,
     },
     Binding {

@@ -1,157 +1,35 @@
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::process::Command;
-use std::sync::OnceLock;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use sha2::{Digest, Sha256};
-
 use crate::error::CsError;
 
-const MAX_BACKUPS: usize = 3;
-
-pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
-const ALIGNED_CODEX_VERSION: &str = "0.159.2";
-static CODEX_CLI_VERSION: OnceLock<String> = OnceLock::new();
-
-pub(crate) fn codex_cli_version() -> &'static str {
-    CODEX_CLI_VERSION.get_or_init(|| {
-        let detected = crate::launch::command_on_path("codex").and_then(|path| {
-            let mut command = std::process::Command::new(path);
-            command.arg("--version");
-            let output = crate::process::output_with_timeout(command, Duration::from_secs(2)).ok()?;
-            if !output.status.success() { return None; }
-            String::from_utf8_lossy(&output.stdout).split_whitespace()
-                .find_map(|word| semver::Version::parse(word).ok())
-        });
-        detected.map(|version| format!("{}.{}.{}", version.major, version.minor, version.patch))
-            .unwrap_or_else(|| ALIGNED_CODEX_VERSION.to_string())
-    }).as_str()
-}
-
-/// User-Agent in the upstream shape: `codex_cli_rs/<version> (<os>; <arch>)`.
-pub(crate) fn codex_user_agent() -> String {
+/// User-Agent: `paper-claude-switch/<version> (<os>; <arch>)`.
+pub(crate) fn user_agent() -> String {
     format!(
-        "codex_cli_rs/{} ({}; {})",
-        codex_cli_version(),
+        "paper-claude-switch/{} ({}; {})",
+        env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH
     )
 }
-pub(crate) const ISSUER: &str = "https://auth.openai.com";
-const DEFAULT_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
-pub(crate) fn token_url() -> String {
-    std::env::var("CS_TOKEN_URL").unwrap_or_else(|_| DEFAULT_TOKEN_URL.to_string())
-}
-
-/// Serializes tests that redirect endpoint URLs (`CS_TOKEN_URL`, and the
-/// warmup equivalents) at a mock server. Environment variables are
-/// process-global, so a per-module lock only serializes that module and lets
-/// tests in a sibling module retarget the variable mid-request; both modules
-/// must take this one. Mirrors `profile::TEST_ENV_LOCK`, which does the same
-/// for the `HOME` / `CODEX_HOME` group.
-#[cfg(test)]
-pub(crate) static URL_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-/// User Codex home (`$CODEX_HOME`, or `~/.codex`). Provider launches retain
-/// this shared home and select a private native config profile.
-pub(crate) fn user_codex_home() -> Result<PathBuf> {
-    codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())
-}
-
-/// ~/.codex/auth.json (or $CODEX_HOME/auth.json)
-pub fn codex_auth_path() -> Result<PathBuf> {
-    let codex_home = user_codex_home()?;
-    validate_cli_auth_credentials_store(&codex_home)?;
-    Ok(codex_home.join("auth.json"))
-}
-
-/// Resolve the filesystem location without consulting managed policy. Callers
-/// may use this only after performing the operation-specific policy check.
-pub(crate) fn codex_auth_path_unchecked() -> Result<PathBuf> {
-    let codex_home = user_codex_home()?;
-    Ok(codex_home.join("auth.json"))
-}
-
-pub(crate) fn ensure_file_credentials_store() -> Result<()> {
-    ensure_chatgpt_backend_supported("use ChatGPT OAuth")
-}
-
-pub(crate) fn ensure_chatgpt_backend_supported(operation: &str) -> Result<()> {
-    let codex_home = user_codex_home()?;
-    crate::auth_policy::ensure_file_oauth_environment(operation)?;
-    crate::auth_policy::load_auth_policy(&codex_home)?.validate_file_oauth(operation)
-}
-
-fn codex_home_from_values(
-    configured_home: Option<OsString>,
-    user_home: Option<PathBuf>,
-) -> Result<PathBuf> {
-    if let Some(home) = configured_home.filter(|value| !value.is_empty()) {
-        let path = PathBuf::from(&home);
-        if path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        {
-            anyhow::bail!(
-                "CODEX_HOME contains '..' component which is not allowed: {}",
-                path.display()
-            );
-        }
-        return Ok(path);
+/// The user's Claude config directory (`$CLAUDE_CONFIG_DIR`, or `~/.claude`).
+/// It belongs to Claude Code, so this app never changes its permissions.
+#[cfg(windows)]
+fn claude_config_home() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty()) {
+        return Ok(PathBuf::from(dir));
     }
-
-    let home = user_home.ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    Ok(home.join(".codex"))
-}
-
-fn validate_cli_auth_credentials_store(codex_home: &Path) -> Result<()> {
-    crate::auth_policy::ensure_file_oauth_environment("access live ChatGPT credentials")?;
-    crate::auth_policy::load_auth_policy(codex_home)?.validate_file_oauth("use ChatGPT OAuth")
-}
-
-#[cfg(test)]
-fn validate_managed_auth_config(config: &toml::Value, account_id: Option<&str>) -> Result<()> {
-    let text = toml::to_string(config)?;
-    let policy = crate::auth_policy::resolve_from_texts(None, Some(&text), None, None, None)?;
-    policy.validate_file_oauth("use ChatGPT OAuth")?;
-    policy.validate_workspace(account_id)
-}
-
-/// Effective workspace ids permitted by Codex managed policy. Invalid or
-/// unreadable policy is an error so the OAuth authorize page is never opened
-/// with a broader workspace selection than the policy allows.
-pub(crate) fn configured_forced_workspace_ids() -> Result<Vec<String>> {
-    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
-    let policy = crate::auth_policy::load_auth_policy(&codex_home)?;
-    Ok(policy.workspace_allowlist())
-}
-
-pub(crate) fn validate_managed_chatgpt_account(id_token: &str) -> Result<()> {
-    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
-    let policy = crate::auth_policy::load_auth_policy(&codex_home)?;
-    let auth = serde_json::json!({"tokens": {"id_token": id_token}});
-    let account_id = crate::jwt::parse_account_info(&auth).account_id;
-    policy.validate_workspace(account_id.as_deref())
-}
-
-/// Enforce the managed ChatGPT workspace policy for a complete auth value.
-/// Keep this at credential-write boundaries: JWT claims are only a routing
-/// hint until a caller has otherwise authenticated the credentials.
-pub(crate) fn validate_managed_auth_value(auth: &serde_json::Value) -> Result<()> {
-    let codex_home = codex_home_from_values(std::env::var_os("CODEX_HOME"), dirs::home_dir())?;
-    let policy = crate::auth_policy::load_auth_policy(&codex_home)?;
-    let account_id = crate::jwt::parse_account_info(auth).account_id;
-    policy.validate_workspace(account_id.as_deref())
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    Ok(home.join(".claude"))
 }
 
 /// ~/.paper-claude-switch/
 pub fn app_home() -> Result<PathBuf> {
-    // Keep application state relocatable without changing Codex's own home.
+    // Keep application state relocatable without changing Claude's own home.
     if let Some(path) = std::env::var_os("PAPER_CLAUDE_SWITCH_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(path));
     }
@@ -185,7 +63,7 @@ pub fn read_auth(path: &Path) -> Result<serde_json::Value> {
 pub(crate) fn atomic_write_private(path: &Path, contents: &[u8]) -> Result<()> {
     #[cfg(windows)]
     {
-        let shared_home = user_codex_home().ok();
+        let shared_home = claude_config_home().ok();
         let owned_home = app_home().ok();
         atomic_write_private_inner(
             path,
@@ -261,7 +139,7 @@ fn windows_private_acl_sddl(current_user_sid: &str, directory: bool) -> String {
 #[cfg(windows)]
 fn should_harden_windows_parent(
     parent: &Path,
-    shared_codex_home: Option<&Path>,
+    claude_home: Option<&Path>,
     owned_app_home: Option<&Path>,
     existed_before_write: bool,
 ) -> bool {
@@ -269,11 +147,11 @@ fn should_harden_windows_parent(
         return true;
     }
 
-    // Skip a shared Codex home only when all three existing paths resolve
-    // successfully. Canonical paths avoid treating a sibling such as
-    // `codex-switch-old` as a descendant of `paper-claude-switch`; resolution errors
-    // fail closed and retain directory hardening.
-    let (Some(shared), Some(owned)) = (shared_codex_home, owned_app_home) else {
+    // Leave Claude Code's own config directory alone only when all three
+    // existing paths resolve. Canonical paths avoid treating a sibling such as
+    // `paper-claude-switch-old` as a descendant of `paper-claude-switch`;
+    // resolution errors fail closed and retain directory hardening.
+    let (Some(shared), Some(owned)) = (claude_home, owned_app_home) else {
         return true;
     };
     let (Ok(parent_real), Ok(shared_real), Ok(owned_real)) = (
@@ -510,8 +388,8 @@ fn windows_acl_security_descriptor(
         .collect();
 
     // Writing a directory DACL makes Windows re-propagate inheritance through
-    // the whole tree below it. `$CODEX_HOME` holds Codex sessions, worktrees,
-    // and caches (tens of thousands of entries), where that took seconds on
+    // the whole tree below it. A large tree (thousands of entries) made that
+    // take seconds on
     // every write. Skip the write when the exact protected DACL is already in
     // place; anything else, including an extra or missing ACE, is rewritten.
     if apply && windows_dacl_already_matches(&path_wide, dacl) {
@@ -710,185 +588,12 @@ pub(crate) fn harden_windows_private_file(path: &Path) -> Result<()> {
     harden_windows_acl(path, false)
 }
 
-pub fn write_auth(path: &Path, val: &serde_json::Value) -> Result<()> {
-    let raw = serde_json::to_string_pretty(val)?;
-    atomic_write_private(path, raw.as_bytes())
-}
-
-pub fn sha256_file(path: &Path) -> Option<String> {
-    let data = std::fs::read(path).ok()?;
-    let digest = Sha256::digest(&data);
-    Some(hex::encode(digest))
-}
-
-pub fn backup_auth(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let contents =
-        std::fs::read(path).with_context(|| format!("reading backup source {}", path.display()))?;
-    let bak = allocate_backup_path(path)?;
-    atomic_write_private(&bak, &contents)
-        .with_context(|| format!("backing up {} -> {}", path.display(), bak.display()))?;
-    cleanup_old_backups(path);
-    Ok(())
-}
-
-/// A backup path no earlier backup already occupies.
-///
-/// Nanoseconds rather than seconds: two switches inside one second are ordinary
-/// (`use` followed by `launch`, or any script), and a second-resolution name
-/// made the later backup overwrite the earlier one — quietly retaining fewer
-/// real recovery points than `MAX_BACKUPS` promises.
-///
-/// The wider stamp still sorts correctly in `cleanup_old_backups` against
-/// legacy seconds names, because the leading ten digits of a nanosecond stamp
-/// are that same second, so the shorter name compares as the earlier one.
-fn allocate_backup_path(path: &Path) -> Result<PathBuf> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before the Unix epoch")?
-        .as_nanos();
-    for collision in 0..1000u16 {
-        let candidate = if collision == 0 {
-            path.with_extension(format!("json.bak.{nanos}"))
-        } else {
-            path.with_extension(format!("json.bak.{nanos}-{collision}"))
-        };
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    anyhow::bail!(
-        "could not allocate a unique backup path for {}",
-        path.display()
-    )
-}
-
-pub fn update_tokens(
-    path: &Path,
-    id_token: &str,
-    access_token: &str,
-    refresh_token: &str,
-) -> Result<()> {
-    let mut val = read_auth(path)?;
-    apply_tokens(&mut val, id_token, access_token, refresh_token)
-        .with_context(|| format!("updating tokens in {}", path.display()))?;
-    validate_managed_auth_value(&val)?;
-    write_auth(path, &val)
-}
-
-pub fn apply_tokens(
-    val: &mut serde_json::Value,
-    id_token: &str,
-    access_token: &str,
-    refresh_token: &str,
-) -> Result<()> {
-    let tokens = val
-        .get_mut("tokens")
-        .and_then(|t| t.as_object_mut())
-        .ok_or_else(|| anyhow::anyhow!("auth.json missing tokens object"))?;
-
-    tokens.insert("id_token".into(), serde_json::json!(id_token));
-    tokens.insert("access_token".into(), serde_json::json!(access_token));
-    tokens.insert("refresh_token".into(), serde_json::json!(refresh_token));
-    // Codex refreshes proactively when last_refresh is older than 8 days;
-    // stamping it here keeps our refreshes recognized (matches upstream).
-    if let Some(obj) = val.as_object_mut() {
-        obj.insert(
-            "last_refresh".into(),
-            serde_json::json!(crate::output::format_iso8601(now_unix_secs())),
-        );
-    }
-    Ok(())
-}
-
-/// Extract (access_token, refresh_token) from an auth.json Value.
-pub fn extract_tokens(val: &serde_json::Value) -> (Option<String>, Option<String>) {
-    let at = val
-        .pointer("/tokens/access_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let rt = val
-        .pointer("/tokens/refresh_token")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    (at, rt)
-}
-
-pub fn extract_id_token(val: &serde_json::Value) -> Option<String> {
-    val.pointer("/tokens/id_token")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-}
-
 /// Current unix timestamp in seconds.
 pub fn now_unix_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
-}
-
-/// Read auth.json and parse AccountInfo in one step (returns default on error).
-pub fn read_account_info(path: &Path) -> crate::jwt::AccountInfo {
-    read_auth(path)
-        .map(|v| {
-            let mut info = crate::jwt::parse_account_info(&v);
-            crate::cache::apply_workspace_name(&mut info);
-            info
-        })
-        .unwrap_or_default()
-}
-
-pub fn validate_auth_value(val: &serde_json::Value) -> Result<crate::jwt::AccountInfo> {
-    let tokens = val
-        .get("tokens")
-        .and_then(|t| t.as_object())
-        .ok_or_else(|| anyhow::anyhow!("auth.json missing tokens object"))?;
-
-    let id_token = tokens
-        .get("id_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("tokens.id_token is required"))?;
-
-    let has_access = tokens
-        .get("access_token")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty());
-    let has_refresh = tokens
-        .get("refresh_token")
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.trim().is_empty());
-
-    if !has_access && !has_refresh {
-        return Err(anyhow::anyhow!(
-            "tokens.access_token or tokens.refresh_token is required"
-        ));
-    }
-
-    let payload = id_token
-        .split('.')
-        .nth(1)
-        .ok_or_else(|| anyhow::anyhow!("tokens.id_token is not a valid JWT"))?;
-    let decoded = {
-        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-        URL_SAFE_NO_PAD
-            .decode(payload)
-            .map_err(|_| anyhow::anyhow!("tokens.id_token payload is not valid base64url"))?
-    };
-    let _: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|_| anyhow::anyhow!("tokens.id_token payload is not valid JSON"))?;
-
-    let info = crate::jwt::parse_account_info(val);
-    if info.account_id.as_deref().is_none_or(str::is_empty) {
-        return Err(anyhow::anyhow!(
-            "id_token does not contain a usable account_id"
-        ));
-    }
-
-    Ok(info)
 }
 
 /// Build a shared reqwest client with standard user-agent and proxy support.
@@ -909,7 +614,7 @@ pub(crate) fn build_http_client_with_proxy_and_redirect_policy(
     redirect_policy: reqwest::redirect::Policy,
 ) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .user_agent(codex_user_agent())
+        .user_agent(user_agent())
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(60))
         .redirect(redirect_policy);
@@ -926,10 +631,11 @@ pub(crate) fn build_http_client_with_proxy_and_redirect_policy(
         builder = builder.proxy(proxy);
     }
 
-    if let Some(path) = custom_ca_path_from_values(
-        std::env::var_os("CODEX_CA_CERTIFICATE"),
+    if let Some(path) = custom_ca_path_from_values([
+        std::env::var_os("CS_CA_CERTIFICATE"),
+        std::env::var_os("NODE_EXTRA_CA_CERTS"),
         std::env::var_os("SSL_CERT_FILE"),
-    ) {
+    ]) {
         let pem = std::fs::read(&path)
             .with_context(|| format!("reading custom CA bundle {}", path.display()))?;
         let certificates = reqwest::Certificate::from_pem_bundle(&pem)
@@ -948,13 +654,13 @@ pub(crate) fn build_http_client_with_proxy_and_redirect_policy(
     Ok(builder.build()?)
 }
 
-fn custom_ca_path_from_values(
-    codex_ca: Option<OsString>,
-    ssl_cert_file: Option<OsString>,
-) -> Option<PathBuf> {
-    codex_ca
-        .filter(|value| !value.is_empty())
-        .or_else(|| ssl_cert_file.filter(|value| !value.is_empty()))
+/// The first non-empty CA bundle path, in priority order: this tool's own
+/// variable, then the one Claude Code reads, then the OpenSSL convention.
+fn custom_ca_path_from_values(values: [Option<OsString>; 3]) -> Option<PathBuf> {
+    values
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
@@ -990,7 +696,7 @@ fn tls_trust_hint(message: &str) -> Option<&'static str> {
             "\n  hint: the server's certificate was not signed by a CA this machine trusts. \
              An intercepting proxy (Proxyman, Charles, a corporate MITM) re-signs traffic with \
              its own CA — add that CA to the system trust store, or export it as PEM and point \
-             CODEX_CA_CERTIFICATE at the file.",
+             CS_CA_CERTIFICATE at the file.",
         );
     }
     None
@@ -1010,184 +716,14 @@ pub fn format_reqwest_error(context: &str, err: &reqwest::Error) -> anyhow::Erro
     anyhow::anyhow!("{msg}")
 }
 
-/// Format an authentication-request failure without endpoint details or the
-/// reqwest source chain. URLs can contain userinfo and query credentials, and
-/// intermediaries may include request details in lower-level error messages.
-pub(crate) fn format_auth_reqwest_error(context: &str, err: reqwest::Error) -> anyhow::Error {
-    let mut msg = format!("{context}: {}", err.without_url());
-    if let Some(hint) = tls_trust_hint(&msg) {
-        msg.push_str(hint);
-    }
-    anyhow::anyhow!("{msg}")
-}
-
-fn cleanup_old_backups(path: &Path) {
-    let parent = match path.parent() {
-        Some(p) => p,
-        None => return,
-    };
-    let stem = match path.file_name().and_then(|f| f.to_str()) {
-        Some(s) => s,
-        None => return,
-    };
-    let prefix = format!("{stem}.bak.");
-
-    let mut backups: Vec<PathBuf> = std::fs::read_dir(parent)
-        .ok()
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .map(|name| name.starts_with(&prefix))
-                .unwrap_or(false)
-        })
-        .map(|e| e.path())
-        .collect();
-
-    if backups.len() <= MAX_BACKUPS {
-        return;
-    }
-
-    backups.sort();
-    let to_remove = backups.len() - MAX_BACKUPS;
-    for old in &backups[..to_remove] {
-        let _ = std::fs::remove_file(old);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn user_agent_uses_the_same_aligned_version_as_model_requests() {
-        let version = codex_cli_version();
-        assert!(codex_user_agent().starts_with(&format!("codex_cli_rs/{version} ")));
-        assert_eq!(ALIGNED_CODEX_VERSION, "0.159.2");
-    }
-
-
-
-    #[test]
-    fn codex_version_probe_has_a_hard_deadline() {
-        #[cfg(windows)]
-        let command = {
-            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
-            let path = PathBuf::from(root)
-                .join("System32")
-                .join(r"WindowsPowerShell\v1.0\powershell.exe");
-            let mut command = Command::new(path);
-            command.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Start-Sleep -Seconds 5",
-            ]);
-            command
-        };
-        #[cfg(not(windows))]
-        let command = {
-            let mut command = Command::new("/bin/sleep");
-            command.arg("5");
-            command
-        };
-        let start = std::time::Instant::now();
-        let error = crate::process::output_with_timeout(command, Duration::from_millis(100))
-            .expect_err("a hanging version command must time out");
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(start.elapsed() < Duration::from_secs(1));
-    }
-
-    #[tokio::test]
-    async fn auth_request_errors_do_not_expose_url_credentials() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
-        let url = format!(
-            "http://user-secret:password-secret@{address}/oauth/token?refresh_secret=query-secret"
-        );
-        let error = reqwest::Client::new()
-            .get(url)
-            .send()
-            .await
-            .expect_err("the local listener was closed before the request");
-
-        let formatted =
-            format_auth_reqwest_error("token refresh request failed", error).to_string();
-        for secret in [
-            "user-secret",
-            "password-secret",
-            "refresh_secret",
-            "query-secret",
-        ] {
-            assert!(
-                !formatted.contains(secret),
-                "authentication diagnostics exposed {secret:?}: {formatted}"
-            );
-        }
-        assert!(formatted.contains("token refresh request failed"));
-    }
-
-    fn assert_recent_rfc3339(value: &serde_json::Value) {
-        let text = value.as_str().expect("last_refresh should be a string");
-        let parsed = chrono::DateTime::parse_from_rfc3339(text).expect("RFC3339 last_refresh");
-        let age = chrono::Utc::now().signed_duration_since(parsed);
-        assert!(
-            age.num_seconds().abs() < 60,
-            "last_refresh not recent: {text}"
-        );
-    }
-
-    #[test]
-    fn test_apply_tokens_updates_last_refresh() {
-        let mut val = json!({
-            "OPENAI_API_KEY": null,
-            "tokens": {
-                "id_token": "old-id",
-                "access_token": "old-access",
-                "refresh_token": "old-refresh",
-                "account_id": "acct"
-            },
-            "last_refresh": "2020-01-01T00:00:00Z"
-        });
-
-        apply_tokens(&mut val, "new-id", "new-access", "new-refresh").unwrap();
-
-        assert_eq!(val["tokens"]["access_token"], "new-access");
-        assert_recent_rfc3339(&val["last_refresh"]);
-    }
-
-    #[test]
-    fn test_update_tokens_updates_last_refresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        write_auth(
-            &path,
-            &json!({
-                "tokens": { "id_token": "a", "access_token": "b", "refresh_token": "c" },
-                "last_refresh": "2020-01-01T00:00:00Z"
-            }),
-        )
-        .unwrap();
-
-        update_tokens(&path, "new-id", "new-access", "new-refresh").unwrap();
-
-        let val = read_auth(&path).unwrap();
-        assert_eq!(val["tokens"]["refresh_token"], "new-refresh");
-        assert_recent_rfc3339(&val["last_refresh"]);
-    }
-
-    #[test]
-    fn test_user_agent_matches_upstream_shape() {
-        let ua = codex_user_agent();
-        let version = codex_cli_version();
-        assert!(
-            ua.starts_with(&format!("codex_cli_rs/{version} (")),
-            "unexpected UA: {ua}"
-        );
+    fn user_agent_names_this_tool() {
+        let ua = user_agent();
+        assert!(ua.starts_with("paper-claude-switch/"), "unexpected UA: {ua}");
         assert!(ua.ends_with(')'));
     }
 
@@ -1210,178 +746,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_write_auth_sets_private_permissions() {
+    fn atomic_private_write_sets_private_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
+        let path = dir.path().join("credentials.json");
 
-        write_auth(&path, &json!({ "tokens": {} })).unwrap();
+        atomic_write_private(&path, br#"{"claudeAiOauth":{}}"#).unwrap();
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-    }
-
-    fn backup_names(dir: &std::path::Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
-            .filter(|name| name.starts_with("auth.json.bak."))
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// Two switches inside one second are ordinary — `use` then `launch`, or
-    /// any script. A second-resolution backup name made the later one overwrite
-    /// the earlier, so the pre-switch credentials the user expected to be able
-    /// to recover were gone and `MAX_BACKUPS` retained fewer real recovery
-    /// points than it claims.
-    #[test]
-    fn two_backups_within_the_same_second_are_both_retained() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-
-        write_auth(&path, &json!({ "tokens": { "refresh_token": "first" } })).unwrap();
-        backup_auth(&path).unwrap();
-        write_auth(&path, &json!({ "tokens": { "refresh_token": "second" } })).unwrap();
-        backup_auth(&path).unwrap();
-
-        let names = backup_names(dir.path());
-        assert_eq!(
-            names.len(),
-            2,
-            "the first backup must survive a second one taken in the same second: {names:?}"
-        );
-    }
-
-    /// `cleanup_old_backups` orders by file name, and this release changes the
-    /// timestamp from seconds to nanoseconds — so both widths can sit in one
-    /// directory. Lexicographic order stays equal to age order here because a
-    /// 10-digit seconds value is compared against the leading 10 digits of the
-    /// 19-digit nanosecond value, which are that same second. This test pins
-    /// that reasoning so a future format change cannot break it silently.
-    #[test]
-    fn cleanup_keeps_the_newest_backups_across_both_timestamp_widths() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        write_auth(&path, &json!({ "tokens": {} })).unwrap();
-
-        // Oldest first: a legacy seconds name, then three nanosecond names.
-        for suffix in [
-            "1785000000",
-            "1785000001000000000",
-            "1785000002000000000",
-            "1785000003000000000",
-        ] {
-            std::fs::write(dir.path().join(format!("auth.json.bak.{suffix}")), b"x").unwrap();
-        }
-
-        cleanup_old_backups(&path);
-
-        assert_eq!(
-            backup_names(dir.path()),
-            vec![
-                "auth.json.bak.1785000001000000000",
-                "auth.json.bak.1785000002000000000",
-                "auth.json.bak.1785000003000000000",
-            ],
-            "the legacy seconds backup is the oldest and must be the one dropped"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_backup_auth_sets_private_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-
-        write_auth(&path, &json!({ "tokens": {} })).unwrap();
-        backup_auth(&path).unwrap();
-
-        let backup = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|entry| entry.ok().map(|e| e.path()))
-            .find(|candidate| candidate != &path)
-            .expect("backup file should exist");
-
-        let mode = std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-
-    #[test]
-    fn test_explicit_non_file_credentials_stores_are_rejected() {
-        for mode in ["keyring", "auto", "ephemeral"] {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(
-                dir.path().join("config.toml"),
-                format!("cli_auth_credentials_store = \"{mode}\"\n"),
-            )
-            .unwrap();
-
-            let err = validate_cli_auth_credentials_store(dir.path()).unwrap_err();
-
-            assert!(
-                err.to_string()
-                    .contains("cli_auth_credentials_store = \"file\"")
-            );
-        }
-    }
-
-    #[test]
-    fn test_missing_credentials_store_defaults_to_file() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "model = \"gpt-5\"\n").unwrap();
-
-        validate_cli_auth_credentials_store(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn test_explicit_file_credentials_store_is_allowed() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("config.toml"),
-            "cli_auth_credentials_store = \"file\"\n",
-        )
-        .unwrap();
-
-        validate_cli_auth_credentials_store(dir.path()).unwrap();
-    }
-
-    #[test]
-    fn test_empty_codex_home_falls_back_to_default_home() {
-        let user_home = PathBuf::from("/test-user-home");
-
-        let codex_home =
-            codex_home_from_values(Some(std::ffi::OsString::from("")), Some(user_home.clone()))
-                .unwrap();
-
-        assert_eq!(codex_home, user_home.join(".codex"));
-    }
-
-    #[test]
-    fn test_managed_auth_rejects_api_only_policy() {
-        let config: toml::Value = toml::from_str("forced_login_method = \"api\"\n").unwrap();
-
-        let err = validate_managed_auth_config(&config, Some("workspace-a")).unwrap_err();
-
-        assert!(err.to_string().contains("requires API key login"));
-    }
-
-    #[test]
-    fn test_managed_auth_enforces_workspace_list() {
-        let config: toml::Value = toml::from_str(
-            "forced_login_method = \"chatgpt\"\nforced_chatgpt_workspace_id = [\"workspace-a\", \"workspace-b\"]\n",
-        )
-        .unwrap();
-
-        validate_managed_auth_config(&config, Some("workspace-b")).unwrap();
-        let err = validate_managed_auth_config(&config, Some("workspace-c")).unwrap_err();
-
-        assert!(err.to_string().contains("workspace-c"));
     }
 
     #[test]
@@ -1396,18 +770,24 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_ca_prefers_codex_ca_and_ignores_empty_values() {
-        let selected = custom_ca_path_from_values(
-            Some(OsString::from("/certs/codex.pem")),
+    fn custom_ca_takes_the_first_non_empty_variable() {
+        let own = custom_ca_path_from_values([
+            Some(OsString::from("/certs/own.pem")),
+            Some(OsString::from("/certs/node.pem")),
             Some(OsString::from("/certs/ssl.pem")),
-        );
-        assert_eq!(selected, Some(PathBuf::from("/certs/codex.pem")));
+        ]);
+        assert_eq!(own, Some(PathBuf::from("/certs/own.pem")));
 
-        let fallback = custom_ca_path_from_values(
+        let node = custom_ca_path_from_values([
             Some(OsString::from("")),
+            Some(OsString::from("/certs/node.pem")),
             Some(OsString::from("/certs/ssl.pem")),
-        );
-        assert_eq!(fallback, Some(PathBuf::from("/certs/ssl.pem")));
+        ]);
+        assert_eq!(node, Some(PathBuf::from("/certs/node.pem")));
+
+        let ssl = custom_ca_path_from_values([None, None, Some(OsString::from("/certs/ssl.pem"))]);
+        assert_eq!(ssl, Some(PathBuf::from("/certs/ssl.pem")));
+        assert_eq!(custom_ca_path_from_values([None, Some(OsString::new()), None]), None);
     }
 
     #[test]
@@ -1415,7 +795,7 @@ mod tests {
         let msg = "Usage API request failed: error sending request\n  caused by: invalid peer certificate: UnknownIssuer";
         let hint = super::tls_trust_hint(msg).expect("UnknownIssuer must carry a hint");
         assert!(
-            hint.contains("CODEX_CA_CERTIFICATE"),
+            hint.contains("CS_CA_CERTIFICATE"),
             "the hint must name the variable that fixes it: {hint}"
         );
     }
@@ -1448,11 +828,11 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn shared_codex_parent_acl_is_left_alone_but_owned_parent_is_hardened() {
+    fn claude_home_acl_is_left_alone_but_owned_parent_is_hardened() {
         let root = tempfile::tempdir().unwrap();
-        let shared = root.path().join(".codex");
+        let shared = root.path().join(".claude");
         let owned = root.path().join("paper-claude-switch");
-        let sibling = root.path().join("codex-switch-old");
+        let sibling = root.path().join("paper-claude-switch-old");
         std::fs::create_dir(&shared).unwrap();
         std::fs::create_dir(&sibling).unwrap();
         std::fs::create_dir_all(owned.join("profiles").join("one")).unwrap();
@@ -1480,7 +860,7 @@ mod tests {
             Some(&owned),
             true
         ));
-        let sibling_alias = owned.join("..").join("codex-switch-old");
+        let sibling_alias = owned.join("..").join("paper-claude-switch-old");
         assert!(!super::should_harden_windows_parent(
             &sibling_alias,
             Some(&sibling_alias),

@@ -21,7 +21,6 @@ enum Focus {
     TuiRefresh,
     SafetyMargin,
     TeamPriority,
-    RestoreDelay,
 }
 
 const FOCUS_ORDER: &[Focus] = &[
@@ -32,7 +31,6 @@ const FOCUS_ORDER: &[Focus] = &[
     Focus::TuiRefresh,
     Focus::SafetyMargin,
     Focus::TeamPriority,
-    Focus::RestoreDelay,
 ];
 
 pub struct SettingsState {
@@ -60,6 +58,7 @@ impl SettingsState {
         self.dirty
     }
 
+    #[cfg(test)]
     pub(crate) fn focused_index(&self) -> usize {
         FOCUS_ORDER
             .iter()
@@ -228,7 +227,6 @@ impl SettingsState {
             Focus::MaxConcurrent => self.draft.network.max_concurrent.to_string(),
             Focus::TuiRefresh => self.draft.tui.auto_refresh_interval_secs.to_string(),
             Focus::SafetyMargin => format_num(self.draft.use_cfg.safety_margin_7d),
-            Focus::RestoreDelay => self.draft.launch.restore_delay_secs.to_string(),
             Focus::TeamPriority => return,
         };
         self.input = value;
@@ -257,10 +255,6 @@ impl SettingsState {
                 self.draft.use_cfg.safety_margin_7d = parse_f64(&raw, "use.safety_margin_7d")?;
             }
             Focus::TeamPriority => {}
-            Focus::RestoreDelay => {
-                self.draft.launch.restore_delay_secs =
-                    parse_u64(&raw, 1, "launch.restore_delay_secs")?;
-            }
         }
         self.dirty = true;
         Ok(())
@@ -379,9 +373,6 @@ fn field_hint(focus: Focus) -> &'static str {
         Focus::TuiRefresh => "Seconds between refreshes while `t` auto-refresh is on (minimum 30).",
         Focus::SafetyMargin => "7d headroom % below which auto-select penalizes an account.",
         Focus::TeamPriority => "Prefer Team-plan accounts when auto-selecting.",
-        Focus::RestoreDelay => {
-            "Seconds `launch` waits before restoring auth.json after starting Codex\n(minimum 1; 0 would restore it before Codex has read it)."
-        }
     }
 }
 
@@ -536,23 +527,6 @@ pub fn render_settings_tab(
     );
     lines.push(Line::from(""));
     line_focus.push(None);
-    lines.push(Line::from(Span::styled("Launch", header())));
-    line_focus.push(None);
-    push_field(
-        settings,
-        Focus::RestoreDelay,
-        "launch.restore_delay_secs",
-        field_value(
-            settings,
-            Focus::RestoreDelay,
-            &settings.draft.launch.restore_delay_secs.to_string(),
-        ),
-        &mut lines,
-        &mut line_focus,
-        &mut focused_line,
-    );
-    lines.push(Line::from(""));
-    line_focus.push(None);
     if let Some(error) = &settings.error {
         lines.push(Line::from(Span::styled(error.clone(), base().fg(C_RED))));
         line_focus.push(None);
@@ -625,7 +599,6 @@ mod tests {
             network,
             tui,
             use_cfg,
-            launch,
         } = AppConfig::default();
         let crate::config::ProxyConfig {
             url: _,
@@ -640,10 +613,7 @@ mod tests {
             safety_margin_7d: _,
             team_priority: _,
         } = use_cfg;
-        let crate::config::LaunchConfig {
-            restore_delay_secs: _,
-        } = launch;
-        assert_eq!(FOCUS_ORDER.len(), 8);
+        assert_eq!(FOCUS_ORDER.len(), 7);
     }
 
     fn type_value(settings: &mut SettingsState, value: &str) {
@@ -692,8 +662,6 @@ mod tests {
         type_value(&mut settings, "15");
         move_to(&mut settings, Focus::TeamPriority);
         settings.handle_key(KeyCode::Enter);
-        move_to(&mut settings, Focus::RestoreDelay);
-        type_value(&mut settings, "5");
         assert!(settings.is_dirty());
 
         match settings.try_save() {
@@ -713,7 +681,6 @@ mod tests {
         assert_eq!(loaded.tui.auto_refresh_interval_secs, 60);
         assert_eq!(loaded.use_cfg.safety_margin_7d, 15.0);
         assert!(!loaded.use_cfg.team_priority);
-        assert_eq!(loaded.launch.restore_delay_secs, 5);
         unsafe {
             match prev_cs {
                 Some(v) => std::env::set_var("PAPER_CLAUDE_SWITCH_HOME", v),
