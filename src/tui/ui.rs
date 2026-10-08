@@ -332,6 +332,10 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         .accounts
         .iter()
         .any(|entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.primary.is_some()));
+    // The session-limit reset column only appears once an account has an offer.
+    let show_reset = app.accounts.iter().any(
+        |entry| matches!(&entry.usage, UsageStatus::Loaded(usage) if usage.session_reset.is_some()),
+    );
     let hdr = base().fg(C_CYAN).add_modifier(Modifier::BOLD);
     let mut header_cells = vec![
         Cell::from(" ").style(base().fg(DIM)),
@@ -348,6 +352,9 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         header_cells.push(Cell::from("5h Reset").style(hdr));
     }
     header_cells.push(Cell::from("7d Reset").style(hdr));
+    if show_reset {
+        header_cells.push(Cell::from("Reset").style(hdr));
+    }
     header_cells.push(Cell::from("Plan until").style(hdr));
 
     let header = Row::new(header_cells).height(1);
@@ -592,6 +599,16 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
                 cells.push(Cell::from(reset_5h).style(base().fg(reset_5h_color)));
             }
             cells.push(Cell::from(reset_7d).style(base().fg(reset_7d_color)));
+            if show_reset {
+                let (text, ready) = match &entry.usage {
+                    UsageStatus::Loaded(u) => {
+                        crate::claude_usage::session_reset_label(u.session_reset.as_ref())
+                    }
+                    _ => ("--".into(), false),
+                };
+                let color = if ready { C_GREEN } else { DIM };
+                cells.push(Cell::from(text).style(base().fg(color)));
+            }
             let until_color = match until_level {
                 crate::claude_usage::ExpiryLevel::Soon => C_YELLOW,
                 crate::claude_usage::ExpiryLevel::Bad => C_RED,
@@ -681,6 +698,9 @@ fn render_account_table(f: &mut Frame, app: &mut App, area: Rect) {
         constraints.push(Constraint::Length(12)); // 5h reset
     }
     constraints.push(Constraint::Length(12)); // 7d reset
+    if show_reset {
+        constraints.push(Constraint::Length(16)); // session-limit reset ("next 10-12 09:00")
+    }
     constraints.push(Constraint::Length(16)); // plan until ("ends ~10-20")
 
 

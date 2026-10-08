@@ -45,6 +45,8 @@ struct CacheEntry {
     individual_limit: Option<Box<crate::usage::SpendControlLimit>>,
     #[serde(default)]
     additional_limits: Vec<crate::usage::AdditionalRateLimit>,
+    #[serde(default)]
+    session_reset: Option<crate::claude_api::SessionReset>,
 }
 
 /// Last answer of the profile endpoint for one alias.
@@ -187,6 +189,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         rate_limit_reached_type: u.rate_limit_reached_type.clone(),
         individual_limit: u.individual_limit.clone(),
         additional_limits: u.additional_limits.clone(),
+        session_reset: u.session_reset.clone(),
     }
 }
 
@@ -225,6 +228,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         individual_limit: e.individual_limit.clone(),
         additional_limits: e.additional_limits.clone(),
         subscription_status: None,
+        session_reset: e.session_reset.clone(),
     }
 }
 
@@ -286,6 +290,52 @@ pub fn put(alias: &str, usage: &UsageInfo) {
     }) {
         tracing::warn!("Failed to write cache: {err}");
     }
+}
+
+/// How long a status-line reading with the same numbers keeps the stored one.
+const LIVE_REFRESH_SECS: u64 = 60;
+/// The status line must not hang behind a busy cache.
+const LIVE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Store the windows Claude Code reported for `alias` as a fresh reading,
+/// keeping the per-model limits, the session-reset offer and the rest of the
+/// stored entry. Skipped when the numbers are unchanged and the stored reading
+/// is younger than 60 s. A window that is `None` keeps the stored one.
+/// Returns whether the cache file was written.
+pub fn put_live_windows(
+    alias: &str,
+    primary: Option<crate::usage::WindowUsage>,
+    secondary: Option<crate::usage::WindowUsage>,
+) -> Result<bool> {
+    with_cache_file_lock_at(&cache_lock_path()?, LIVE_LOCK_WAIT, || {
+        let mut cache = load_cache();
+        let now = now_secs();
+        let mut usage = cache.entries.get(alias).map(from_entry).unwrap_or_default();
+        let same = |new: &Option<crate::usage::WindowUsage>, old: &Option<crate::usage::WindowUsage>| {
+            new.as_ref().is_none_or(|new| {
+                old.as_ref().is_some_and(|old| {
+                    (new.used_percent, new.resets_at, new.window_minutes)
+                        == (old.used_percent, old.resets_at, old.window_minutes)
+                })
+            })
+        };
+        let age = now.saturating_sub(
+            usage.fetched_at.and_then(|t| u64::try_from(t).ok()).unwrap_or(0),
+        );
+        if cache.entries.contains_key(alias)
+            && same(&primary, &usage.primary)
+            && same(&secondary, &usage.secondary)
+            && age < LIVE_REFRESH_SECS
+        {
+            return Ok(false);
+        }
+        usage.fetched_at = i64::try_from(now).ok();
+        usage.primary = primary.or(usage.primary);
+        usage.secondary = secondary.or(usage.secondary);
+        cache.entries.insert(alias.to_string(), to_entry(&usage));
+        save_cache(&cache)?;
+        Ok(true)
+    })
 }
 
 /// Milliseconds left of the rate-limit pause of `alias`, when one is running.

@@ -67,6 +67,8 @@ pub struct UsageInfo {
     /// Subscription status from the profile endpoint ("active", "canceled",
     /// "past_due", ...), when known.
     pub subscription_status: Option<String>,
+    /// Claude's "reset your session limit" offer, when the account has one.
+    pub session_reset: Option<crate::claude_api::SessionReset>,
 }
 
 /// One assembled display row for an additional-limit pool. Pure data,

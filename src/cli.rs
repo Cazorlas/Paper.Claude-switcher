@@ -160,6 +160,15 @@ Example: paper-claude-switch launch work -- --resume")]
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Feed Claude Code's status-line usage into the cache (no network); use as the status line command
+    #[command(
+        after_help = "Claude Code pipes a JSON object with `rate_limits` to the status line command. This reads it for the active account and updates the usage cache, so `list`, the TUI and `auto` need no usage request for it. Pass your existing status line command after -- and its output is printed unchanged.\n\nExample settings.json:\n  \"statusLine\": {\"type\": \"command\", \"command\": \"paper-claude-switch statusline -- <your existing status line command>\"}"
+    )]
+    Statusline {
+        /// Next status line command and its arguments (after --); stdin is passed on to it
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Launch the interactive TUI
     Tui,
     /// Open the paper-claude-switch data directory (~/.paper-claude-switch, or $PAPER_CLAUDE_SWITCH_HOME) in the system file manager

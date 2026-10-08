@@ -156,6 +156,21 @@ There is no hidden background service: nothing registers itself to start with Wi
 paper-claude-switch auto --once --json
 ```
 
+## Status line
+
+Claude Code can hand the active account's 5h and 7d usage to a status line command. `paper-claude-switch statusline` stores those numbers in its usage cache, so `list`, the `tui` and `auto` read the active account from the cache instead of asking the usage endpoint while Claude Code is running. It never uses the network.
+
+In `~/.claude/settings.json`, put it in front of your existing status line command (everything after `--` is run with the same input, and its output is shown unchanged):
+
+```json
+"statusLine": {
+  "type": "command",
+  "command": "paper-claude-switch statusline -- <your existing status line command>"
+}
+```
+
+Without a command after `--` it prints one line, for example `personal 5h 38% · 7d 12%`. If anything goes wrong, the status line still shows the next command's output (or nothing).
+
 ## How it works
 
 A switch replaces only `claudeAiOauth` in the credentials file and `oauthAccount` in `~/.claude.json`, keeping MCP logins and every other setting. It holds Claude Code's own lock directories while writing.

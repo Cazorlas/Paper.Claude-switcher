@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use serde_json::Value;
 
-use crate::claude_api::{ClaudeUsage, Endpoints, UsageError as ApiError};
+use crate::claude_api::{ClaudeUsage, Endpoints, SessionReset, UsageError as ApiError};
 use crate::claude_store::{self, ClaudePaths, LiveAccount};
 use crate::usage::{AdditionalRateLimit, UsageError, UsageInfo, WindowUsage};
 
@@ -48,8 +48,32 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
                 ..Default::default()
             })
             .collect(),
+        session_reset: usage.session_reset,
         ..Default::default()
     }
+}
+
+/// Table cell for the session-limit reset offer: `ready` (with `N/wk` when
+/// more than one reset a week), `next MM-DD HH:MM` in local time when it is
+/// used up for now, else `--`. The flag is true when a reset can be used now.
+pub fn session_reset_label(reset: Option<&SessionReset>) -> (String, bool) {
+    let Some(reset) = reset.filter(|reset| reset.eligible) else {
+        return ("--".into(), false);
+    };
+    if reset.available {
+        let text = if reset.resets_per_week > 1 {
+            format!("ready {}/wk", reset.resets_per_week)
+        } else {
+            "ready".into()
+        };
+        return (text, true);
+    }
+    let next = reset
+        .next_available_at
+        .as_deref()
+        .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+        .map(|at| at.with_timezone(&chrono::Local).format("next %m-%d %H:%M").to_string());
+    (next.unwrap_or_else(|| "--".into()), false)
 }
 
 fn usage_error(error: ApiError) -> UsageError {

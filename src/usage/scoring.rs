@@ -339,6 +339,7 @@ mod tests {
             individual_limit: None,
             additional_limits: vec![],
             subscription_status: None,
+            session_reset: None,
         }
     }
 

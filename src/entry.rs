@@ -155,6 +155,7 @@ fn command_name(cmd: &Commands) -> &'static str {
         Commands::ImportOrca { .. } => "import-orca",
         Commands::SelfUpdate { .. } => "self-update",
         Commands::Launch { .. } => "launch",
+        Commands::Statusline { .. } => "statusline",
         Commands::Tui => "tui",
         Commands::Open => "open",
         Commands::Doctor => "doctor",
@@ -187,6 +188,7 @@ async fn dispatch(
                 | Commands::SelfUpdate { .. }
                 | Commands::Open
                 | Commands::Launch { .. }
+                | Commands::Statusline { .. }
                 | Commands::Doctor
         )
     {
@@ -231,6 +233,7 @@ async fn dispatch(
             let args = merge_launch_args(args, launch_passthrough);
             commands::launch_cmd(alias.as_deref(), args, json).await?
         }
+        Commands::Statusline { args } => commands::statusline_cmd(args)?,
         Commands::Tui => tui::run_tui().await?,
         Commands::Open => commands::open_cmd()?,
         Commands::Doctor => commands::doctor_cmd(json)?,

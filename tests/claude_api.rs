@@ -38,6 +38,7 @@ fn expected_usage() -> ClaudeUsage {
             resets_at: Some("2026-06-26T17:59:59Z".into()),
         }],
         spend: None,
+        session_reset: None,
     }
 }
 

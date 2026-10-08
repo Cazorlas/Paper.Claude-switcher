@@ -24,12 +24,24 @@ pub struct Spend {
     pub currency: String,
 }
 
+/// Claude's "reset your session limit" offer (`juniper_tide` in the usage reply).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SessionReset {
+    pub eligible: bool,
+    pub ineligible_reason: Option<String>,
+    pub available: bool,
+    pub next_available_at: Option<String>,
+    pub resets_per_week: u32,
+    pub billing_period: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClaudeUsage {
     pub five_hour: Option<Window>,
     pub seven_day: Option<Window>,
     pub models: Vec<ModelWindow>,
     pub spend: Option<Spend>,
+    pub session_reset: Option<SessionReset>,
 }
 
 pub fn parse_usage(v: &Value) -> Option<ClaudeUsage> {
@@ -76,6 +88,46 @@ pub fn parse_usage(v: &Value) -> Option<ClaudeUsage> {
         seven_day,
         models,
         spend,
+        session_reset: v.get("juniper_tide").and_then(parse_session_reset),
+    })
+}
+
+/// The `juniper_tide` block; `None` when it is null or malformed.
+fn parse_session_reset(block: &Value) -> Option<SessionReset> {
+    // An absent or null field takes its default; a field of the wrong type
+    // makes the whole block malformed.
+    fn field<'a>(block: &'a Value, key: &str) -> Option<&'a Value> {
+        block.get(key).filter(|value| !value.is_null())
+    }
+    fn text(value: Option<&Value>) -> Option<Option<String>> {
+        match value {
+            None => Some(None),
+            Some(value) => value.as_str().map(|s| Some(s.to_owned())),
+        }
+    }
+    if !block.is_object() {
+        return None;
+    }
+    let eligible = block.get("eligible")?.as_bool()?;
+    let available = match field(block, "available") {
+        None => false,
+        Some(value) => value.as_bool()?,
+    };
+    let resets_per_week = match field(block, "resets_per_week") {
+        None => 1,
+        Some(value) => u32::try_from(value.as_u64()?).ok()?,
+    };
+    let billing_period = match field(block, "event_props") {
+        None => None,
+        Some(props) => text(field(props, "billing_period"))?,
+    };
+    Some(SessionReset {
+        eligible,
+        ineligible_reason: text(field(block, "ineligible_reason"))?,
+        available,
+        next_available_at: text(field(block, "next_available_at"))?,
+        resets_per_week,
+        billing_period,
     })
 }
 

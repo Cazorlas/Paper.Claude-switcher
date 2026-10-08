@@ -64,6 +64,15 @@ pub struct JsonAdditionalLimit {
     pub secondary: Option<Box<JsonWindow>>,
 }
 
+/// Claude's "reset your session limit" offer.
+#[derive(Serialize)]
+pub struct JsonSessionReset {
+    pub eligible: bool,
+    pub available: bool,
+    pub next_available_at: Option<String>,
+    pub resets_per_week: u32,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum JsonUsage {
@@ -71,6 +80,7 @@ pub enum JsonUsage {
         fetched_at: String,
         primary: Option<Box<JsonWindow>>,
         secondary: Option<Box<JsonWindow>>,
+        session_reset: Option<JsonSessionReset>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         additional_limits: Vec<JsonAdditionalLimit>,
     },
@@ -187,6 +197,12 @@ pub fn usage_to_json(result: Result<&UsageInfo, &str>) -> JsonUsage {
                     .secondary
                     .as_ref()
                     .map(|w| Box::new(window_to_json(w, "7d", crate::usage::WINDOW_7D_SECS))),
+                session_reset: u.session_reset.as_ref().map(|reset| JsonSessionReset {
+                    eligible: reset.eligible,
+                    available: reset.available,
+                    next_available_at: reset.next_available_at.clone(),
+                    resets_per_week: reset.resets_per_week,
+                }),
                 additional_limits: u
                     .additional_limits
                     .iter()
