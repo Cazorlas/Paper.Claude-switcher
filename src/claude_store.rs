@@ -131,6 +131,9 @@ pub struct ImportOutcome {
 /// read from another app's files; rejects what a profile could not hold.
 pub fn account_from_parts(credentials: &Value, account: &Value) -> Result<LiveAccount> {
     let oauth = credentials.get("claudeAiOauth").context("credentials hold no claudeAiOauth")?;
+    if signed_out(oauth) {
+        bail!("this login was signed out (its tokens are empty)");
+    }
     validate_account(oauth, account)?;
     live_account(credentials, &json!({"oauthAccount": account}))?
         .context("account holds no accountUuid")
@@ -254,8 +257,19 @@ fn validate_account(oauth: &Value, account: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Claude Code signs out by blanking the tokens and keeping `oauthAccount`, so
+/// a login with neither token is no login at all: saving it over a profile
+/// would replace a working login with nothing.
+fn signed_out(oauth: &Value) -> bool {
+    let token = |key: &str| oauth.get(key).and_then(Value::as_str).is_some_and(|t| !t.is_empty());
+    !token("accessToken") && !token("refreshToken")
+}
+
 fn live_account(credentials: &Value, config: &Value) -> Result<Option<LiveAccount>> {
     let Some(oauth) = credentials.get("claudeAiOauth") else { return Ok(None); };
+    if signed_out(oauth) {
+        return Ok(None);
+    }
     let Some(account) = config.get("oauthAccount") else { return Ok(None); };
     let Some(uuid) = account_uuid(account) else { return Ok(None); };
     validate_account(oauth, account)?;
