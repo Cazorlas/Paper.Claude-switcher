@@ -1,6 +1,6 @@
 {
   "name": "paper-claude-switch",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "description": "Multi-account switcher for Claude Code CLI and VS Code extension with automatic switching before the usage limit",
   "license": "MIT",
   "repository": "github:Cazorlas/Paper.Claude-switcher",

@@ -127,8 +127,11 @@ async fn claude_api_05_fetch_usage_headers_and_body() {
     assert_eq!(calls.usage_headers.len(), 1);
     assert_eq!(calls.usage_headers[0]["authorization"], "Bearer tok");
     assert_eq!(calls.usage_headers[0]["anthropic-beta"], "oauth-2025-04-20");
-    assert_eq!(calls.usage_headers[0]["user-agent"],
-        format!("paper-claude-switch/{}", env!("CARGO_PKG_VERSION")));
+    // Anthropic tells only Claude Code whether this week's session reset was
+    // used, so the usage request identifies itself the way Claude Code does.
+    let agent = calls.usage_headers[0]["user-agent"].to_str().unwrap();
+    assert!(agent.starts_with("claude-cli/") && agent.ends_with(" (external, cli)"), "{agent}");
+    assert_eq!(calls.usage_headers[0]["x-app"], "cli");
 }
 
 #[tokio::test]

@@ -179,6 +179,12 @@ Orca may rewrite its status line when it updates its hooks; re-apply this line t
 
 Without a command after `--` it prints one line, for example `personal 5h 38% · 7d 12%`. If anything goes wrong, the status line still shows the next command's output (or nothing).
 
+## Resets column
+
+Claude Max gives a number of session-limit resets each week (claimed in Claude Code with `/rate-limit-options` when you hit the 5-hour wall). The Resets column shows how many are left: `1`, `1 ready` at the wall, `0 → MM-DD HH:MM` when used until that time, `n/a` when the plan has none, and `?` when Anthropic did not say.
+
+Anthropic only reveals this to Claude Code itself, so the usage request identifies as Claude Code (`User-Agent: claude-cli/<version>`, `x-app: cli`). If Anthropic starts expecting a newer Claude Code version, set `CS_CLAUDE_CODE_VERSION` (for example to the output of `claude --version`) until paper-claude-switch is updated.
+
 ## How it works
 
 A switch replaces only `claudeAiOauth` in the credentials file and `oauthAccount` in `~/.claude.json`, keeping MCP logins and every other setting. It holds Claude Code's own lock directories while writing.

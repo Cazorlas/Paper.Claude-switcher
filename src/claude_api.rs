@@ -170,6 +170,19 @@ pub enum UsageError {
     BadResponse(String),
 }
 
+/// Claude Code version the usage request names; `CS_CLAUDE_CODE_VERSION`
+/// overrides it when Anthropic starts expecting a newer one.
+const CLAUDE_CODE_VERSION: &str = "2.1.294";
+
+/// The User-Agent Claude Code sends, e.g. `claude-cli/2.1.294 (external, cli)`.
+pub fn claude_code_user_agent() -> String {
+    let version = std::env::var("CS_CLAUDE_CODE_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+        .unwrap_or_else(|| CLAUDE_CODE_VERSION.to_owned());
+    format!("claude-cli/{version} (external, cli)")
+}
+
 pub async fn fetch_usage(
     client: &reqwest::Client,
     ep: &Endpoints,
@@ -182,10 +195,10 @@ pub async fn fetch_usage(
         ))
         .bearer_auth(access_token)
         .header("anthropic-beta", "oauth-2025-04-20")
-        .header(
-            "User-Agent",
-            concat!("paper-claude-switch/", env!("CARGO_PKG_VERSION")),
-        )
+        // Anthropic tells only Claude Code whether this week's session reset
+        // was used (other clients get "surface"), so identify as Claude Code.
+        .header("User-Agent", claude_code_user_agent())
+        .header("x-app", "cli")
         .send()
         .await
         .map_err(|error| UsageError::Network(error.to_string()))?;
