@@ -10,7 +10,9 @@ use crate::{cache, claude_store, claude_usage};
 /// `statusline [-- <next command...>]`: feed Claude Code's `rate_limits` into
 /// the usage cache without any network call. Whatever goes wrong inside, the
 /// status line still gets the next command's output (or nothing) and exit 0.
-pub(crate) fn statusline_cmd(next: Vec<String>) -> Result<()> {
+/// With `tee`, stdin goes back out unchanged instead of the summary line, so
+/// the command can feed another status line through a shell pipe.
+pub(crate) fn statusline_cmd(tee: bool, next: Vec<String>) -> Result<()> {
     let mut input = Vec::new();
     if std::io::stdin().read_to_end(&mut input).is_err() {
         input.clear();
@@ -22,6 +24,12 @@ pub(crate) fn statusline_cmd(next: Vec<String>) -> Result<()> {
             None
         }
     };
+    if tee {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&input);
+        let _ = out.flush();
+        return Ok(());
+    }
     if next.is_empty() {
         if let Some(line) = line {
             let _ = writeln!(std::io::stdout(), "{line}");

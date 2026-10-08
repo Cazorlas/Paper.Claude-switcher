@@ -335,3 +335,28 @@ async fn statusline_ignores_an_unsaved_account() {
     assert_eq!(f.cache_bytes(), None, "no cache entry for an unknown account");
     assert_eq!(f.mock.total_requests(), 0);
 }
+
+/// `--tee`: the numbers are stored and stdin comes back out byte for byte, so
+/// the command can sit in front of another status line in a shell pipe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statusline_tee_stores_the_rate_limits_and_echoes_stdin() {
+    let f = Fixture::new("U1").await;
+    let input = rate_limits_stdin();
+
+    let output = f.run_with_stdin(&["statusline", "--tee"], &input);
+
+    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.stdout, input, "stdin is echoed unchanged");
+    assert_eq!(f.mock.total_requests(), 0);
+    let rows = f.rows();
+    assert_eq!(rows[0]["usage"]["primary"]["used_percent"], 37.5, "{}", rows[0]);
+}
+
+/// `--tee` with input it cannot use still echoes it unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn statusline_tee_echoes_garbage_unchanged() {
+    let f = Fixture::new("U1").await;
+    let output = f.run_with_stdin(&["statusline", "--tee"], b"not json");
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"not json");
+}

@@ -162,9 +162,12 @@ Example: paper-claude-switch launch work -- --resume")]
     },
     /// Feed Claude Code's status-line usage into the cache (no network); use as the status line command
     #[command(
-        after_help = "Claude Code pipes a JSON object with `rate_limits` to the status line command. This reads it for the active account and updates the usage cache, so `list`, the TUI and `auto` need no usage request for it. Pass your existing status line command after -- and its output is printed unchanged.\n\nExample settings.json:\n  \"statusLine\": {\"type\": \"command\", \"command\": \"paper-claude-switch statusline -- <your existing status line command>\"}"
+        after_help = "Claude Code pipes a JSON object with `rate_limits` to the status line command. This reads it for the active account and updates the usage cache, so `list`, the TUI and `auto` need no usage request for it. Pass your existing status line command after -- and its output is printed unchanged, or use --tee to put this in front of a shell status line command.\n\nExample settings.json:\n  \"statusLine\": {\"type\": \"command\", \"command\": \"paper-claude-switch statusline -- <your existing status line command>\"}\n  \"statusLine\": {\"type\": \"command\", \"command\": \"{ paper-claude-switch statusline --tee 2>/dev/null || cat; } | { <your existing shell command>; }\"}"
     )]
     Statusline {
+        /// Print stdin back unchanged, to sit in front of another status line in a shell pipe
+        #[arg(long)]
+        tee: bool,
         /// Next status line command and its arguments (after --); stdin is passed on to it
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,

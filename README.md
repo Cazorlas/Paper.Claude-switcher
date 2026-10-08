@@ -169,6 +169,14 @@ In `~/.claude/settings.json`, put it in front of your existing status line comma
 }
 ```
 
+If your status line is a shell script (Orca writes one), put this in front of it in a pipe instead; `--tee` passes the input on unchanged, and `|| cat` keeps your status line working if paper-claude-switch is missing:
+
+```json
+"command": "{ paper-claude-switch statusline --tee 2>/dev/null || cat; } | { <your existing shell command>; }"
+```
+
+Orca may rewrite its status line when it updates its hooks; re-apply this line then.
+
 Without a command after `--` it prints one line, for example `personal 5h 38% · 7d 12%`. If anything goes wrong, the status line still shows the next command's output (or nothing).
 
 ## How it works
