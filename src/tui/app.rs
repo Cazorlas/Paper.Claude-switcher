@@ -134,6 +134,30 @@ pub enum ConfirmAction {
     DiscardSettings,
     Delete(String),
     BatchDelete(Vec<String>),
+    /// Use one reset of the grant `label`; `resets_left` and `ends_at` are shown in the prompt.
+    UseReset {
+        alias: String,
+        label: String,
+        resets_left: u32,
+        ends_at: Option<String>,
+    },
+}
+
+/// Starts a claim for (alias, request id). Injectable so tests never reach the real endpoint.
+pub type ResetClaimer = Arc<dyn Fn(String, String) -> ClaimFuture + Send + Sync>;
+
+pub type ClaimFuture = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = Result<crate::claude_api::ResetClaim, crate::claude_api::ClaimError>,
+            > + Send,
+    >,
+>;
+
+fn default_reset_claimer() -> ResetClaimer {
+    Arc::new(|alias: String, request_id: String| -> ClaimFuture {
+        Box::pin(async move { crate::claude_usage::claim_reset(&alias, &request_id).await })
+    })
 }
 
 pub struct RenameState {
@@ -203,12 +227,30 @@ pub struct App {
     pending_switches: tokio::sync::mpsc::Receiver<SwitchCompletion>,
     switch_sender: tokio::sync::mpsc::Sender<SwitchCompletion>,
     switching_alias: Option<String>,
+    /// Starts a reset claim; replaced by a fake in every test.
+    pub claimer: ResetClaimer,
+    /// Accounts with a reset claim on its way.
+    pub reset_in_flight: BTreeSet<String>,
+    /// Accounts whose last claim may or may not have used a reset; no new claim
+    /// until a fresh usage reading of the account arrives.
+    reset_unknown: BTreeSet<String>,
+    /// Request id of each claim without a definite outcome. A retry reuses it,
+    /// so the server cannot spend two resets for one decision.
+    reset_request_ids: HashMap<String, String>,
+    pending_resets: tokio::sync::mpsc::Receiver<ResetClaimDone>,
+    reset_sender: tokio::sync::mpsc::Sender<ResetClaimDone>,
 }
+
+type ResetClaimDone = (
+    String,
+    Result<crate::claude_api::ResetClaim, crate::claude_api::ClaimError>,
+);
 
 impl App {
     pub fn new() -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(128);
         let (switch_tx, switch_rx) = tokio::sync::mpsc::channel(4);
+        let (reset_tx, reset_rx) = tokio::sync::mpsc::channel(16);
         let cfg = crate::config::get();
         App {
             log_writer: crate::logging::tui_log_writer(),
@@ -250,6 +292,12 @@ impl App {
             pending_switches: switch_rx,
             switch_sender: switch_tx,
             switching_alias: None,
+            claimer: default_reset_claimer(),
+            reset_in_flight: BTreeSet::new(),
+            reset_unknown: BTreeSet::new(),
+            reset_request_ids: HashMap::new(),
+            pending_resets: reset_rx,
+            reset_sender: reset_tx,
         }
     }
 
@@ -887,6 +935,153 @@ impl App {
         self.set_status(format!("Refreshing {alias}"), 3);
     }
 
+    /// Ask to use a reset of `alias`: opens the confirmation when its loaded
+    /// usage names a usable grant and no claim is running or unsettled.
+    pub fn request_use_reset(&mut self, alias: &str) {
+        use crate::claude_api::usable_reset_grant;
+
+        let Some(entry) = self.accounts.iter().find(|entry| entry.alias == alias) else {
+            return;
+        };
+        if self.reset_in_flight.contains(alias) {
+            self.set_status_error(format!("A reset for {alias} is already being used"), 5);
+            return;
+        }
+        if self.reset_unknown.contains(alias) {
+            self.set_status_error(
+                format!(
+                    "The last reset for {alias} may have been used; refresh {alias} (r), then try again"
+                ),
+                8,
+            );
+            return;
+        }
+        let grant = match &entry.usage {
+            UsageStatus::Loaded(usage) => usable_reset_grant(
+                usage.reset_grants.as_deref(),
+                usage.next_reset_grant.as_deref(),
+                auth::now_unix_secs(),
+            ),
+            _ => None,
+        };
+        let Some(grant) = grant else {
+            self.set_status_error(format!("No reset to use for {alias}"), 5);
+            return;
+        };
+        self.confirm = Some(ConfirmAction::UseReset {
+            alias: alias.to_owned(),
+            label: grant.label.clone(),
+            resets_left: grant.resets_left,
+            ends_at: grant.ends_at.clone(),
+        });
+    }
+
+    /// Claim a reset in the background; the result comes back on `pending_resets`.
+    fn start_reset_claim(&mut self, alias: String) {
+        if self.reset_in_flight.contains(&alias) {
+            self.set_status_error(format!("A reset for {alias} is already being used"), 5);
+            return;
+        }
+        let request_id = self
+            .reset_request_ids
+            .entry(alias.clone())
+            .or_insert_with(crate::claude_api::new_request_id)
+            .clone();
+        self.reset_in_flight.insert(alias.clone());
+        self.set_status(format!("Using a reset for {alias}..."), 60);
+        let claimer = self.claimer.clone();
+        let sender = self.reset_sender.clone();
+        tokio::spawn(async move {
+            // A panic inside the claim must still report, as an unknown outcome.
+            let claim = tokio::spawn(claimer(alias.clone(), request_id));
+            let result = claim.await.unwrap_or_else(|error| {
+                Err(crate::claude_api::ClaimError::Unknown(format!("claim task failed: {error}")))
+            });
+            let _ = sender.send((alias, result)).await;
+        });
+    }
+
+    fn poll_reset_results(&mut self) {
+        while let Ok((alias, result)) = self.pending_resets.try_recv() {
+            self.handle_reset_claim_result(alias, result);
+        }
+    }
+
+    /// Report a finished claim and refresh the account's usage. Only a definite
+    /// outcome settles the request id; an unknown one blocks the account until
+    /// its next usage reading.
+    pub(crate) fn handle_reset_claim_result(
+        &mut self,
+        alias: String,
+        result: Result<crate::claude_api::ResetClaim, crate::claude_api::ClaimError>,
+    ) {
+        use crate::claude_api::{ClaimError, ClaimResult, UsageError as ApiError};
+
+        self.reset_in_flight.remove(&alias);
+        if !matches!(result, Err(ClaimError::Unknown(_))) {
+            self.reset_request_ids.remove(&alias);
+        }
+        match result {
+            Ok(claim) => match claim.result {
+                ClaimResult::Reset => {
+                    let left = claim
+                        .resets_left
+                        .map(|left| format!(" · {left} left"))
+                        .unwrap_or_default();
+                    self.set_status(format!("Reset used for {alias}{left}"), 8);
+                }
+                ClaimResult::AlreadyUsed => {
+                    self.set_status_error(format!("Reset already used for {alias}"), 8);
+                }
+                ClaimResult::NotLimited => {
+                    self.set_status_error(format!("{alias} is not at its limit; nothing to reset"), 8);
+                }
+                ClaimResult::Cooldown => {
+                    let until = claim
+                        .cooldown_until
+                        .as_deref()
+                        .map(|at| match chrono::DateTime::parse_from_rfc3339(at) {
+                            Ok(at) => format!(
+                                " until {}",
+                                at.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                            ),
+                            Err(_) => format!(" until {at}"),
+                        })
+                        .unwrap_or_default();
+                    self.set_status_error(format!("Reset for {alias} is on cooldown{until}"), 8);
+                }
+                ClaimResult::Ineligible => {
+                    self.set_status_error(format!("{alias} is not eligible for a reset"), 8);
+                }
+                ClaimResult::Unavailable => {
+                    self.set_status_error(format!("Reset unavailable for {alias}"), 8);
+                }
+            },
+            Err(ClaimError::Rejected(error)) => {
+                let why = match error {
+                    ApiError::RateLimited { .. } => "rate limited; try again later".to_owned(),
+                    ApiError::Unauthorized => "sign-in expired; log in again".to_owned(),
+                    ApiError::TokenExpired => {
+                        "token expired; use Claude Code once to renew it".to_owned()
+                    }
+                    ApiError::Http(status) => format!("HTTP {status}"),
+                    ApiError::Network(message) | ApiError::BadResponse(message) => message,
+                };
+                self.set_status_error(format!("No reset used for {alias}: {why}"), 8);
+            }
+            Err(ClaimError::Unknown(message)) => {
+                self.reset_unknown.insert(alias.clone());
+                self.set_status_error(
+                    format!("Reset for {alias}: outcome unknown ({message}); refreshing"),
+                    10,
+                );
+            }
+        }
+        if let Some(idx) = self.accounts.iter().position(|entry| entry.alias == alias) {
+            self.fetch_usage_for(idx, Refresh::Forced);
+        }
+    }
+
     pub fn poll_update(&mut self) {
         if let Some(rx) = &mut self.update_rx {
             match rx.try_recv() {
@@ -1050,6 +1245,7 @@ impl App {
     }
 
     pub fn poll_results(&mut self) {
+        self.poll_reset_results();
         let mut changed = false;
         let open_account_alias = match self.menu.as_ref() {
             Some(super::menu::MenuState::Account { info, .. }) => Some(info.alias.clone()),
@@ -1069,6 +1265,8 @@ impl App {
             };
             self.accounts[idx].usage = match result {
                 Ok(u) => {
+                    // Fresh usage shows whether an unknown claim used a reset.
+                    self.reset_unknown.remove(&alias);
                     if matches!(refresh, Refresh::Forced) {
                         tracing::info!(action = "usage_refresh", alias = %alias, outcome = "completed", "usage refresh completed");
                     }
@@ -1259,6 +1457,7 @@ impl App {
         };
         match action {
             ConfirmAction::DiscardSettings => return true,
+            ConfirmAction::UseReset { alias, .. } => self.start_reset_claim(alias),
             ConfirmAction::Delete(alias) => match cmd_delete(&alias) {
                 Ok(()) => {
                     self.set_status(format!("Deleted {alias} (recoverable)"), 3);
@@ -1989,6 +2188,10 @@ async fn handle_menu_key(
             }
             app.close_menu();
             app.request_delete_alias(&alias);
+        }
+        MenuAction::UseReset(alias) => {
+            app.close_menu();
+            app.request_use_reset(&alias);
         }
         MenuAction::BatchRefresh => {
             app.close_menu();
@@ -3118,6 +3321,245 @@ mod tests {
             "force refresh must retain the last value until its replacement arrives"
         );
         assert_eq!(app.loading_count(), 1);
+    }
+
+    // ── Using a usage-limit reset ───────────────────────────────────────────
+    // Every test installs a claimer that only records its calls: the real claim
+    // path would spend a real reset of a real account.
+
+    type Calls = std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    fn usage_with_usable_grant() -> UsageInfo {
+        UsageInfo {
+            reset_grants: Some(vec![crate::claude_api::ResetGrant {
+                id: "g2".into(),
+                paused: false,
+                clears: Vec::new(),
+                label: "Launch reset".into(),
+                resets_left: 1,
+                resets_total: 1,
+                ends_at: Some("2099-10-22T16:00:00Z".into()),
+                usable_now: true,
+            }]),
+            next_reset_grant: Some("g2".into()),
+            ..Default::default()
+        }
+    }
+
+    /// An App with account "work" holding `usage`, a claimer that records its
+    /// calls and never finishes, and a usage refresh of "work" already running
+    /// (a forced one queues behind it) with a limiter that lets no fetch start.
+    fn reset_app(usage: UsageInfo) -> (App, Calls) {
+        let mut app = App::new();
+        app.accounts.push(AccountEntry {
+            alias: "work".into(),
+            info: AccountInfo::default(),
+            usage: UsageStatus::Loaded(Box::new(usage)),
+            is_current: false,
+        });
+        app.view_indices = vec![0];
+        app.usage_limiter = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        app.refreshing_requests
+            .insert("work".into(), (1, Refresh::Cached));
+        let calls = Calls::default();
+        let recorded = calls.clone();
+        app.claimer = std::sync::Arc::new(
+            move |alias: String, request_id: String| -> super::ClaimFuture {
+                recorded.lock().unwrap().push((alias, request_id));
+                Box::pin(std::future::pending())
+            },
+        );
+        (app, calls)
+    }
+
+    fn status_lower(app: &App) -> String {
+        app.status_msg.clone().unwrap_or_default().to_lowercase()
+    }
+
+    fn forced_refresh_queued(app: &App) -> bool {
+        app.pending_usage_refreshes.get("work") == Some(&Refresh::Forced)
+            || matches!(app.refreshing_requests.get("work"), Some((_, Refresh::Forced)))
+    }
+
+    async fn wait_for_calls(calls: &Calls, count: usize) {
+        for _ in 0..100 {
+            if calls.lock().unwrap().len() >= count {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn claim(result: crate::claude_api::ClaimResult) -> crate::claude_api::ResetClaim {
+        crate::claude_api::ResetClaim {
+            result,
+            resets_left: None,
+            cleared: Vec::new(),
+            cooldown_until: None,
+        }
+    }
+
+    /// A1: asking opens a confirmation that names the account and the grant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn use_reset_asks_for_confirmation_before_claiming() {
+        let (mut app, calls) = reset_app(usage_with_usable_grant());
+
+        app.request_use_reset("work");
+
+        assert!(
+            matches!(
+                &app.confirm,
+                Some(ConfirmAction::UseReset { alias, label, resets_left, .. })
+                    if alias == "work" && label == "Launch reset" && *resets_left == 1
+            ),
+            "confirm should be UseReset for work / Launch reset / 1 left"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, &mut app))
+            .unwrap();
+        let screen = (0..30)
+            .map(|y| {
+                (0..120)
+                    .map(|x| terminal.backend().buffer().cell((x, y)).unwrap().symbol().to_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Use a reset for 'work'"), "{screen}");
+        assert!(screen.contains("(y/n)"), "{screen}");
+        assert!(calls.lock().unwrap().is_empty(), "asking must not claim anything");
+    }
+
+    /// A2: no usable grant, no question.
+    #[tokio::test(flavor = "current_thread")]
+    async fn use_reset_without_a_usable_grant_is_refused() {
+        let (mut app, calls) = reset_app(UsageInfo::default());
+
+        app.request_use_reset("work");
+
+        assert!(app.confirm.is_none());
+        assert!(app.status_is_error);
+        assert!(status_lower(&app).contains("no reset"), "{:?}", app.status_msg);
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    /// A3: confirming claims once with a fresh request id; a second ask while it runs is refused.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirming_claims_once_and_blocks_a_second_ask() {
+        let (mut app, calls) = reset_app(usage_with_usable_grant());
+        app.request_use_reset("work");
+
+        assert!(!app.confirm_action());
+        wait_for_calls(&calls, 1).await;
+
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "claimer called once: {seen:?}");
+        assert_eq!(seen[0].0, "work");
+        let id = &seen[0].1;
+        assert!(
+            id.len() == 32 && id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "request id should be 32 lowercase hex characters: {id}"
+        );
+        assert!(app.reset_in_flight.contains("work"));
+        assert!(
+            app.status_msg.as_deref().unwrap_or("").contains("Using a reset"),
+            "{:?}",
+            app.status_msg
+        );
+
+        app.request_use_reset("work");
+
+        assert!(app.confirm.is_none());
+        assert!(status_lower(&app).contains("already"), "{:?}", app.status_msg);
+    }
+
+    /// A4: a used reset is good news, ends the claim and refreshes the usage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_used_reset_reports_success_and_refreshes() {
+        let (mut app, _calls) = reset_app(usage_with_usable_grant());
+        app.reset_in_flight.insert("work".into());
+        let mut used = claim(crate::claude_api::ClaimResult::Reset);
+        used.resets_left = Some(0);
+
+        app.handle_reset_claim_result("work".into(), Ok(used));
+
+        assert!(!app.status_is_error, "{:?}", app.status_msg);
+        let status = app.status_msg.clone().unwrap_or_default();
+        assert!(status.contains("Reset used"), "{status}");
+        assert!(status.contains("0 left"), "{status}");
+        assert!(!app.reset_in_flight.contains("work"));
+        assert!(forced_refresh_queued(&app));
+    }
+
+    /// A5: every refusal is an error that says why, and still refreshes the usage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn every_refusal_is_an_error_that_says_why() {
+        use crate::claude_api::{ClaimError, ClaimResult, UsageError};
+        let mut cooldown = claim(ClaimResult::Cooldown);
+        cooldown.cooldown_until = Some("2026-10-10T00:00:00Z".into());
+        let cases = [
+            (Ok(claim(ClaimResult::AlreadyUsed)), "already used"),
+            (Ok(claim(ClaimResult::NotLimited)), "not at its limit"),
+            (Ok(cooldown), "cooldown"),
+            (Ok(claim(ClaimResult::Ineligible)), "not eligible"),
+            (Ok(claim(ClaimResult::Unavailable)), "unavailable"),
+            (
+                Err(ClaimError::Rejected(UsageError::RateLimited { retry_after: None })),
+                "rate limited",
+            ),
+            (Err(ClaimError::Rejected(UsageError::Unauthorized)), "log in"),
+        ];
+        for (result, expected) in cases {
+            let (mut app, _calls) = reset_app(usage_with_usable_grant());
+            app.reset_in_flight.insert("work".into());
+
+            app.handle_reset_claim_result("work".into(), result);
+
+            assert!(app.status_is_error, "`{expected}` is an error: {:?}", app.status_msg);
+            assert!(status_lower(&app).contains(expected), "`{expected}` in {:?}", app.status_msg);
+            assert!(!app.reset_in_flight.contains("work"), "`{expected}` ends the claim");
+            assert!(forced_refresh_queued(&app), "`{expected}` queues a forced refresh");
+        }
+    }
+
+    /// A6: an unknown outcome blocks a new ask until fresh usage arrives, and the
+    /// retry reuses the same request id so the server cannot spend two resets.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unknown_outcome_waits_for_a_refresh_and_retries_with_the_same_id() {
+        let (mut app, calls) = reset_app(usage_with_usable_grant());
+        app.request_use_reset("work");
+        app.confirm_action();
+        wait_for_calls(&calls, 1).await;
+        let first = calls.lock().unwrap()[0].clone();
+
+        app.handle_reset_claim_result(
+            "work".into(),
+            Err(crate::claude_api::ClaimError::Unknown("timeout".into())),
+        );
+
+        assert!(app.status_is_error);
+        assert!(status_lower(&app).contains("outcome unknown"), "{:?}", app.status_msg);
+        app.status_msg = None;
+        app.request_use_reset("work");
+        assert!(app.confirm.is_none(), "no new ask while the outcome is unknown");
+        assert!(status_lower(&app).contains("refresh"), "{:?}", app.status_msg);
+
+        app.result_sender
+            .try_send(("work".into(), 1, Ok(usage_with_usable_grant())))
+            .unwrap();
+        app.poll_results();
+
+        app.request_use_reset("work");
+        assert!(
+            matches!(app.confirm, Some(ConfirmAction::UseReset { .. })),
+            "fresh usage lets the ask open again"
+        );
+        app.confirm_action();
+        wait_for_calls(&calls, 2).await;
+        let seen = calls.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1], first, "the retry reuses the unknown attempt's request id");
     }
 
     #[test]

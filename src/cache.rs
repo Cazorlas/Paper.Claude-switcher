@@ -49,6 +49,8 @@ struct CacheEntry {
     session_reset: Option<crate::claude_api::SessionReset>,
     #[serde(default)]
     reset_grants: Option<Vec<crate::claude_api::ResetGrant>>,
+    #[serde(default)]
+    next_reset_grant: Option<String>,
     /// When the usage endpoint last answered for this alias. The status line
     /// refreshes `ts` without it, so this tells when the rest of the reading
     /// (session reset, per-model windows) needs the endpoint again.
@@ -199,6 +201,7 @@ fn to_entry(u: &UsageInfo) -> CacheEntry {
         additional_limits: u.additional_limits.clone(),
         session_reset: u.session_reset.clone(),
         reset_grants: u.reset_grants.clone(),
+        next_reset_grant: u.next_reset_grant.clone(),
         api_ts: None,
     }
 }
@@ -240,6 +243,7 @@ fn from_entry(e: &CacheEntry) -> UsageInfo {
         subscription_status: None,
         session_reset: e.session_reset.clone(),
         reset_grants: e.reset_grants.clone(),
+        next_reset_grant: e.next_reset_grant.clone(),
     }
 }
 
@@ -498,6 +502,46 @@ mod tests {
         assert_eq!(usage.primary.unwrap().used_percent, Some(25.0));
         assert!(usage.secondary.is_none());
         assert!(!usage.account_limited);
+    }
+
+    #[test]
+    fn cache_entry_written_before_reset_ids_still_loads() {
+        let entry: CacheEntry = serde_json::from_value(json!({
+            "ts": 123,
+            "primary_used": 25.0,
+            "primary_reset": 456,
+            "secondary_used": null,
+            "secondary_reset": null,
+            "reset_grants": [{
+                "label": "launch reset",
+                "resets_left": 1,
+                "resets_total": 1,
+                "ends_at": "2099-10-22T16:00:00+00:00",
+                "usable_now": true
+            }]
+        }))
+        .unwrap();
+        let usage = from_entry(&entry);
+        let grants = usage.reset_grants.expect("grants kept");
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].id, "");
+        assert!(!grants[0].paused);
+        assert!(grants[0].clears.is_empty());
+        assert_eq!(usage.next_reset_grant, None);
+    }
+
+    #[test]
+    fn cache_round_trip_keeps_the_next_reset_grant() {
+        let usage = UsageInfo {
+            fetched_at: Some(10),
+            next_reset_grant: Some("g2".to_string()),
+            ..Default::default()
+        };
+        let restored = from_entry(&to_entry(&usage));
+        assert_eq!(restored.next_reset_grant.as_deref(), Some("g2"));
+        let json = serde_json::to_string(&to_entry(&usage)).unwrap();
+        let entry: CacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(from_entry(&entry).next_reset_grant.as_deref(), Some("g2"));
     }
 
     #[test]

@@ -129,6 +129,12 @@ pub const KEYMAP: &[Binding] = &[
         label: "delete (in the Enter menu)",
         in_status_bar: false,
     },
+    Binding {
+        keys: "c",
+        section: Section::Account,
+        label: "use a usage-limit reset (in the Enter menu)",
+        in_status_bar: false,
+    },
     // Batch actions
     Binding {
         keys: "r",
@@ -300,6 +306,16 @@ mod tests {
                 binding.label
             );
         }
+    }
+
+    /// K1: the help documents `c` as the reset action of the account menu.
+    #[test]
+    fn help_documents_the_reset_key_of_the_account_menu() {
+        let binding = super::KEYMAP
+            .iter()
+            .find(|binding| binding.section == super::Section::Account && binding.keys == "c")
+            .expect("missing Accounts `c` binding");
+        assert!(binding.label.contains("reset"), "label: {}", binding.label);
     }
 
     #[test]

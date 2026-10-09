@@ -45,11 +45,20 @@ pub struct ClaudeUsage {
     /// Usage-limit reset grants (`cedar_ember`); `None` when the reply has no
     /// such block, `Some(vec![])` when the account has no grant.
     pub reset_grants: Option<Vec<ResetGrant>>,
+    /// Id of the grant Claude Code would use next (`next_grant_id`), only when
+    /// the account is eligible and the id names a listed grant.
+    pub next_reset_grant: Option<String>,
 }
 
 /// One usage-limit reset grant, like a Codex reset card.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ResetGrant {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub clears: Vec<String>,
     pub label: String,
     pub resets_left: u32,
     pub resets_total: u32,
@@ -96,14 +105,27 @@ pub fn parse_usage(v: &Value) -> Option<ClaudeUsage> {
     if five_hour.is_none() && seven_day.is_none() && models.is_empty() && spend.is_none() {
         return None;
     }
+    let block = v.get("cedar_ember");
+    let reset_grants = block.and_then(parse_reset_grants);
     Some(ClaudeUsage {
         five_hour,
         seven_day,
         models,
         spend,
         session_reset: v.get("juniper_tide").and_then(parse_session_reset),
-        reset_grants: v.get("cedar_ember").and_then(parse_reset_grants),
+        next_reset_grant: block
+            .and_then(|block| next_reset_grant(block, reset_grants.as_deref()?)),
+        reset_grants,
     })
+}
+
+/// `next_grant_id` of an eligible `cedar_ember` block, when it names a listed grant.
+fn next_reset_grant(block: &Value, grants: &[ResetGrant]) -> Option<String> {
+    if !block.get("eligible")?.as_bool()? {
+        return None;
+    }
+    let next = block.get("next_grant_id")?.as_str()?;
+    (!next.is_empty() && grants.iter().any(|grant| grant.id == next)).then(|| next.to_owned())
 }
 
 /// The grants of a `cedar_ember` block; a malformed grant is skipped.
@@ -115,6 +137,15 @@ fn parse_reset_grants(block: &Value) -> Option<Vec<ResetGrant>> {
             .filter_map(|grant| {
                 let count = |key: &str| u32::try_from(grant.get(key)?.as_u64()?).ok();
                 Some(ResetGrant {
+                    id: grant.get("id").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    paused: grant.get("paused").and_then(Value::as_bool).unwrap_or(false),
+                    clears: grant
+                        .get("clears")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|window| window.as_str().map(str::to_owned))
+                        .collect(),
                     label: grant.get("label").and_then(Value::as_str).unwrap_or("").to_owned(),
                     resets_left: count("resets_left")?,
                     resets_total: count("resets_total").unwrap_or(0),
@@ -261,6 +292,172 @@ pub async fn fetch_usage(
     parse_usage(&body).ok_or_else(|| {
         UsageError::BadResponse("no usable usage windows or spend".to_owned())
     })
+}
+
+/// The grant a reset may be claimed with: the one `next` names, when it is
+/// listed, has resets left, is not paused and has not ended.
+pub fn usable_reset_grant<'a>(
+    grants: Option<&'a [ResetGrant]>,
+    next: Option<&str>,
+    now_unix: i64,
+) -> Option<&'a ResetGrant> {
+    let next = next.filter(|id| !id.is_empty())?;
+    grants?.iter().find(|grant| {
+        // An end time that cannot be read counts as ended: no reset is spent on a guess.
+        let running = grant.ends_at.as_deref().is_none_or(|end| {
+            chrono::DateTime::parse_from_rfc3339(end).is_ok_and(|end| end.timestamp() > now_unix)
+        });
+        grant.id == next && grant.resets_left > 0 && !grant.paused && running
+    })
+}
+
+/// What the server said to a claim.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimResult {
+    Reset,
+    AlreadyUsed,
+    NotLimited,
+    Cooldown,
+    Ineligible,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResetClaim {
+    pub result: ClaimResult,
+    pub resets_left: Option<u32>,
+    pub cleared: Vec<String>,
+    pub cooldown_until: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClaimError {
+    /// The server certainly did not use a reset (never sent, or 429/401/403).
+    Rejected(UsageError),
+    /// A reset may have been used (network error after sending, 5xx, unreadable 2xx).
+    Unknown(String),
+}
+
+/// Ask the server to use one reset of `grant_id`.
+pub async fn claim_reset_grant(
+    client: &reqwest::Client,
+    ep: &Endpoints,
+    access_token: &str,
+    organization_uuid: &str,
+    grant_id: &str,
+    request_id: &str,
+) -> Result<ResetClaim, ClaimError> {
+    // The same limits Claude Code applies before it sends anything.
+    let valid = |text: &str, max: usize, allowed: fn(char) -> bool| {
+        !text.is_empty() && text.len() <= max && text.chars().all(allowed)
+    };
+    let id_ok = valid(grant_id, 40, |c| {
+        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'
+    });
+    let request_ok = valid(request_id, 64, |c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    let org_ok = valid(organization_uuid, 64, |c| c.is_ascii_alphanumeric() || c == '-');
+    if !(id_ok && request_ok && org_ok) {
+        return Err(ClaimError::Rejected(UsageError::BadResponse(
+            "reset claim has an invalid organization, grant or request id".to_owned(),
+        )));
+    }
+    let response = client
+        .post(format!(
+            "{}/api/organizations/{organization_uuid}/reset_rate_limits",
+            ep.api_base.trim_end_matches('/')
+        ))
+        .bearer_auth(access_token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("User-Agent", claude_code_user_agent())
+        .header("x-app", "cli")
+        .timeout(CLAIM_TIMEOUT)
+        .json(&json!({
+            "program": "cedar_ember",
+            "grant_id": grant_id,
+            "request_id": request_id,
+        }))
+        .send()
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            // A failed connection never carried the request.
+            if error.is_connect() {
+                ClaimError::Rejected(UsageError::Network(message))
+            } else {
+                ClaimError::Unknown(message)
+            }
+        })?;
+    let status = response.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|header| header.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(Duration::from_secs);
+        return Err(ClaimError::Rejected(UsageError::RateLimited { retry_after }));
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(ClaimError::Rejected(UsageError::Unauthorized));
+    }
+    if !status.is_success() {
+        return Err(ClaimError::Unknown(format!("reset request answered HTTP {status}")));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| ClaimError::Unknown(error.to_string()))?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| ClaimError::Unknown(format!("invalid reset JSON: {error}")))?;
+    let result = match body.get("result").and_then(Value::as_str) {
+        Some("reset") => ClaimResult::Reset,
+        Some("already_used") => ClaimResult::AlreadyUsed,
+        Some("not_limited") => ClaimResult::NotLimited,
+        Some("cooldown") => ClaimResult::Cooldown,
+        Some("ineligible") => ClaimResult::Ineligible,
+        Some(_) => ClaimResult::Unavailable,
+        None => return Err(ClaimError::Unknown("reset reply has no result".to_owned())),
+    };
+    Ok(ResetClaim {
+        result,
+        resets_left: body
+            .get("resets_left")
+            .and_then(Value::as_u64)
+            .and_then(|left| u32::try_from(left).ok()),
+        cleared: body
+            .get("cleared")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|window| window.as_str().map(str::to_owned))
+            .collect(),
+        cooldown_until: body.get("cooldown_until").and_then(Value::as_str).map(str::to_owned),
+    })
+}
+
+/// How long a claim may take, as in Claude Code.
+const CLAIM_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// A fresh idempotency key: 32 lowercase hex characters.
+pub fn new_request_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    // Each RandomState carries its own random keys.
+    let half = |salt: u64| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(nanos);
+        hasher.write_u64(count);
+        hasher.write_u64(salt);
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", half(1), half(2))
 }
 
 /// What `/api/oauth/profile` says about the organization's subscription.

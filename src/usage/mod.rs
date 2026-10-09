@@ -70,6 +70,8 @@ pub struct UsageInfo {
     /// Claude's "reset your session limit" offer, when the account has one.
     pub session_reset: Option<crate::claude_api::SessionReset>,
     pub reset_grants: Option<Vec<crate::claude_api::ResetGrant>>,
+    /// Id of the grant a reset would be claimed with, when one is usable.
+    pub next_reset_grant: Option<String>,
 }
 
 /// One assembled display row for an additional-limit pool. Pure data,

@@ -341,6 +341,7 @@ mod tests {
             subscription_status: None,
             session_reset: None,
             reset_grants: None,
+            next_reset_grant: None,
         }
     }
 

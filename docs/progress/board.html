@@ -20,6 +20,21 @@ code{font-family:var(--mono);font-size:13px}
 </style>
 <main>
 <header><h1>paper-claude-switch</h1><p class="sub">Progress board. Branch <code>collab/main/claude-switch</code>. Newest task on top.</p></header>
+<section id="use-reset">
+<h2>Use a usage-limit reset from the TUI</h2>
+<p class="sub">Started 2026-10-09. Branch <code>collab/main/use-reset</code>. Planner: Claude (this session). Worker: Claude worker via collab (Codex sandbox cannot link Rust). TUI only, no CLI command (owner's call).</p>
+<div class="wrap"><table>
+<tr><th>Step</th><th>What</th><th>Status</th></tr>
+<tr><td>Plan</td><td>Claim endpoint read from Claude Code: <code>POST /api/organizations/{org}/reset_rate_limits</code>, program <code>cedar_ember</code>, grant <code>next_grant_id</code>, one request id per claim</td><td><span class="st done">done</span></td></tr>
+<tr><td>T1 red</td><td>API layer tests: grant id/next grant, usable grant, claim request and every result, errors, request id, cache</td><td><span class="st done">done, 11 tests locked</span></td></tr>
+<tr><td>T1 green</td><td>Implement the API layer; verified by planner: claim, grants, api, reset suites + 165 lib tests pass, no warnings</td><td><span class="st done">done</span></td></tr>
+<tr><td>T2 red</td><td>Tests: <code>claim_reset</code> per profile (token, org, next grant), menu <code>c reset</code> + hit areas, confirm, in-flight guard, every result on the status line, unknown outcome waits for refresh and reuses its request id</td><td><span class="st done">done, 14 tests locked</span></td></tr>
+<tr><td>T2 green</td><td>TUI: <code>c reset</code> in the account menu, confirm, claim in the background, status line, refresh; verified by planner: 9 integration suites + 175 lib tests pass, no warnings</td><td><span class="st done">done</span></td></tr>
+<tr><td>Release</td><td>v0.6.0 (Cargo.toml, Cargo.lock, VERSION, npm/package.json), README section on the <code>c</code> key; binary builds and reports 0.6.0</td><td><span class="st done">done</span></td></tr>
+<tr><td>Cleanup</td><td>Collab session closed; scratch test snapshots removed; worktree and branch removed after the merge. Not done: weekly session reset (<code>juniper_tide</code>), auto-use when all accounts are exhausted, a claim against the real server</td><td><span class="st done">done</span></td></tr>
+<tr><td>Merge</td><td>Branch <code>collab/main/use-reset</code> squash-merged into <code>main</code> (owner asked 2026-10-09); worktree and branch removed</td><td><span class="st done">done</span></td></tr>
+</table></div>
+</section>
 <section>
 <h2>Build paper-claude-switch from paper-codex-switch + claude-swap</h2>
 <p class="sub">Started 2026-10-08. Planner: Claude (this session). Worker: Codex via collab. Tasks run one at a time to save memory.</p>

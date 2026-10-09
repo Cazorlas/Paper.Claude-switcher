@@ -4,7 +4,9 @@ use anyhow::{Context, Result};
 use chrono::DateTime;
 use serde_json::Value;
 
-use crate::claude_api::{ClaudeUsage, Endpoints, SessionReset, UsageError as ApiError};
+use crate::claude_api::{
+    ClaimError, ClaudeUsage, Endpoints, ResetClaim, SessionReset, UsageError as ApiError,
+};
 use crate::claude_store::{self, ClaudePaths, LiveAccount};
 use crate::usage::{AdditionalRateLimit, UsageError, UsageInfo, WindowUsage};
 
@@ -50,6 +52,7 @@ pub fn usage_info(usage: ClaudeUsage) -> UsageInfo {
             .collect(),
         session_reset: usage.session_reset,
         reset_grants: usage.reset_grants,
+        next_reset_grant: usage.next_reset_grant,
         ..Default::default()
     }
 }
@@ -461,6 +464,61 @@ fn needs_refresh(profile: &Profile) -> bool {
         .is_some_and(|expires| expires <= chrono::Utc::now().timestamp_millis() + 300_000)
 }
 
+/// Why `usage_and_token` failed: before any request (lock, login unreadable),
+/// or in the API call itself.
+enum TokenStepError {
+    Local(UsageError),
+    Api(ApiError),
+}
+
+/// Fresh usage for one profile and the access token that was accepted. The
+/// token step of `fetch` and `claim_reset`: `live_oauth` is Some only for the
+/// active profile, which is read with the live token and never refreshed from
+/// here; any other profile's saved token is refreshed under the app lock.
+async fn usage_and_token(
+    client: &reqwest::Client,
+    endpoints: &Endpoints,
+    profile: &Profile,
+    live_oauth: Option<&Value>,
+) -> Result<(ClaudeUsage, String), TokenStepError> {
+    let local = |summary: &str, detail: String| {
+        TokenStepError::Local(UsageError { summary: summary.into(), detail })
+    };
+    // `auto` and the TUI may run in other processes: hold the app lock while a
+    // rotated token is refreshed and written, so a switch in another process
+    // never activates a token this one has just replaced. The refresh re-reads
+    // the profile file under the lock.
+    let _refresh_lock = if live_oauth.is_none() && needs_refresh(profile) {
+        let locked = tokio::task::spawn_blocking(crate::profile::lock_live_auth)
+            .await
+            .map_err(|e| local("lock failed", e.to_string()))?;
+        Some(locked.map_err(|e| local("another switch is running", format!("{e:#}")))?)
+    } else {
+        None
+    };
+    // Another process may have switched to this profile between the caller's
+    // "inactive" decision and the lock: re-read the live login now and, when it
+    // is this account, read it with the live token instead of refreshing.
+    let rechecked = match (&_refresh_lock, live_oauth) {
+        (Some(_), None) => paths()
+            .and_then(|paths| claude_store::read_live(&paths))
+            .map_err(|e| local("Claude login unreadable", format!("{e:#}")))?
+            .filter(|live| profile.info.account_id.as_deref() == Some(live.account_uuid.as_str()))
+            .map(|live| live.oauth),
+        _ => None,
+    };
+    let live_oauth = live_oauth.or(rechecked.as_ref());
+    crate::claude_api::usage_and_token_for_profile(
+        client,
+        endpoints,
+        &profile.dir,
+        live_oauth.is_some(),
+        live_oauth,
+    )
+    .await
+    .map_err(TokenStepError::Api)
+}
+
 /// Usage for one profile. `live_oauth` is Some only for the active profile,
 /// which is read with the live token and never refreshed from here.
 pub async fn fetch(
@@ -481,57 +539,17 @@ pub async fn fetch(
         summary: "HTTP client error".into(),
         detail: e.to_string(),
     })?;
-    // `auto` and the TUI may run in other processes: hold the app lock while a
-    // rotated token is refreshed and written, so a switch in another process
-    // never activates a token this one has just replaced. The refresh re-reads
-    // the profile file under the lock.
-    let _refresh_lock = if live_oauth.is_none() && needs_refresh(profile) {
-        let locked = tokio::task::spawn_blocking(crate::profile::lock_live_auth)
-            .await
-            .map_err(|e| UsageError {
-                summary: "lock failed".into(),
-                detail: e.to_string(),
-            })?;
-        Some(locked.map_err(|e| UsageError {
-            summary: "another switch is running".into(),
-            detail: format!("{e:#}"),
-        })?)
-    } else {
-        None
-    };
-    // Another process may have switched to this profile between the caller's
-    // "inactive" decision and the lock: re-read the live login now and, when it
-    // is this account, read it with the live token instead of refreshing.
-    let rechecked = match (&_refresh_lock, live_oauth) {
-        (Some(_), None) => paths()
-            .and_then(|paths| claude_store::read_live(&paths))
-            .map_err(|e| UsageError {
-                summary: "Claude login unreadable".into(),
-                detail: format!("{e:#}"),
-            })?
-            .filter(|live| profile.info.account_id.as_deref() == Some(live.account_uuid.as_str()))
-            .map(|live| live.oauth),
-        _ => None,
-    };
-    let live_oauth = live_oauth.or(rechecked.as_ref());
     let endpoints = endpoints();
-    let (raw, token) = match crate::claude_api::usage_and_token_for_profile(
-        &client,
-        &endpoints,
-        &profile.dir,
-        live_oauth.is_some(),
-        live_oauth,
-    )
-    .await
-    {
+    let (raw, token) = match usage_and_token(&client, &endpoints, profile, live_oauth).await {
         Ok(fetched) => fetched,
-        Err(ApiError::RateLimited { retry_after }) => {
+        Err(TokenStepError::Local(error)) => return Err(error),
+        Err(TokenStepError::Api(ApiError::RateLimited { retry_after })) => {
             let wait = retry_after.map_or(DEFAULT_RETRY_AFTER_SECS, |after| after.as_secs());
             let wait_ms = i64::try_from(wait.min(MAX_RETRY_AFTER_SECS) * 1000).unwrap_or(0);
             crate::cache::pause_for_ms(&profile.alias, wait_ms);
             return paused_answer(&profile.alias, wait_ms);
         }
-        Err(error) => return Err(usage_error(error)),
+        Err(TokenStepError::Api(error)) => return Err(usage_error(error)),
     };
     let mut usage = usage_info(raw);
     crate::cache::put(&profile.alias, &usage);
@@ -546,6 +564,54 @@ pub async fn fetch(
     }
     usage.subscription_status = crate::cache::profile_status(&profile.alias);
     Ok(usage)
+}
+
+/// Use one reset of the profile's next usable grant, found in fresh usage. The
+/// active profile is read with the live token and never refreshed (an expired
+/// one is refused); another one gets its token like `fetch` does. Every
+/// failure before the claim is sent is `Rejected`: no reset was spent.
+pub async fn claim_reset(alias: &str, request_id: &str) -> Result<ResetClaim, ClaimError> {
+    let rejected = |what: &str, detail: String| {
+        ClaimError::Rejected(ApiError::BadResponse(format!("{what}: {detail}")))
+    };
+    let profile = read_profile(alias).map_err(|e| rejected("profile unreadable", format!("{e:#}")))?;
+    let live = paths()
+        .and_then(|paths| claude_store::read_live(&paths))
+        .map_err(|e| rejected("Claude login unreadable", format!("{e:#}")))?
+        .filter(|live| profile.info.account_id.as_deref() == Some(live.account_uuid.as_str()));
+    let organization = match &live {
+        Some(live) => live.organization_uuid.clone(),
+        None => std::fs::read(profile.dir.join("account.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|account| account["organizationUuid"].as_str().map(str::to_owned)),
+    }
+    .filter(|organization| !organization.is_empty())
+    .ok_or_else(|| rejected("no organization", format!("{alias} has no organization uuid")))?;
+    let client = crate::auth::build_http_client()
+        .map_err(|e| rejected("HTTP client error", e.to_string()))?;
+    let endpoints = endpoints();
+    let (usage, token) = usage_and_token(&client, &endpoints, &profile, live.as_ref().map(|l| &l.oauth))
+        .await
+        .map_err(|error| match error {
+            TokenStepError::Api(error) => ClaimError::Rejected(error),
+            TokenStepError::Local(error) => rejected(&error.summary, error.detail),
+        })?;
+    let grant = crate::claude_api::usable_reset_grant(
+        usage.reset_grants.as_deref(),
+        usage.next_reset_grant.as_deref(),
+        crate::auth::now_unix_secs(),
+    )
+    .ok_or_else(|| rejected("no reset", format!("{alias} has no usable reset")))?;
+    crate::claude_api::claim_reset_grant(
+        &client,
+        &endpoints,
+        &token,
+        &organization,
+        &grant.id,
+        request_id,
+    )
+    .await
 }
 
 /// Retry-After when the 429 carries none, and the longest pause honored.

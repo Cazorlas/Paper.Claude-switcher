@@ -52,6 +52,20 @@ pub struct AccountMenuInfo {
     pub usage_meta: Vec<String>,
 }
 
+impl AccountMenuInfo {
+    /// True when the loaded usage names a grant a reset can be used with.
+    fn reset_usable(&self) -> bool {
+        self.usage.as_deref().is_some_and(|usage| {
+            crate::claude_api::usable_reset_grant(
+                usage.reset_grants.as_deref(),
+                usage.next_reset_grant.as_deref(),
+                crate::auth::now_unix_secs(),
+            )
+            .is_some()
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MenuAction {
     /// Keep the menu open and ignore the key.
@@ -74,6 +88,8 @@ pub enum MenuAction {
     Rename(String),
     /// Request delete confirmation for alias.
     DeleteRequest(String),
+    /// Ask to use one usage-limit reset of alias.
+    UseReset(String),
 
     // Batch actions ────────────────────────────
     /// Force-refresh all marked accounts.
@@ -288,6 +304,9 @@ impl MenuState {
                 KeyCode::Char('r') => MenuAction::RefreshOne(info.alias.clone()),
 
                 KeyCode::Char('d') => MenuAction::DeleteRequest(info.alias.clone()),
+                KeyCode::Char('c') if info.reset_usable() => {
+                    MenuAction::UseReset(info.alias.clone())
+                }
                 _ => MenuAction::Noop,
             },
             MenuState::Add { .. } => match code {
@@ -396,8 +415,9 @@ impl MenuState {
                     ("l", "login", true),
                     ("n", "rename", true),
                     ("d", "delete", true),
+                    ("c", "reset", info.reset_usable()),
                 ];
-                for row in [&actions[..3], &actions[3..]] {
+                for row in [&actions[..4], &actions[4..]] {
                     let mut action_spans = Vec::new();
                     for (idx, (key, label, enabled)) in row.iter().enumerate() {
                         if idx > 0 {
@@ -422,7 +442,7 @@ impl MenuState {
                 let first_action_line = left_lines.len().saturating_sub(4);
                 let layout = render_popup(f, title, &left_lines, popup, area)?;
                 let mut hit_actions = Vec::new();
-                for (row_offset, row) in [&actions[..3], &actions[3..]].iter().enumerate() {
+                for (row_offset, row) in [&actions[..4], &actions[4..]].iter().enumerate() {
                     let Some(row_area) = layout.line_rect(first_action_line + row_offset) else {
                         continue;
                     };
@@ -594,6 +614,130 @@ mod tests {
             menu.handle_key(KeyCode::Char('o')),
             MenuAction::Launch(alias) if alias == "work"
         ));
+    }
+
+    fn grant(id: &str, resets_left: u32) -> crate::claude_api::ResetGrant {
+        crate::claude_api::ResetGrant {
+            id: id.into(),
+            paused: false,
+            clears: Vec::new(),
+            label: "Launch reset".into(),
+            resets_left,
+            resets_total: 1,
+            ends_at: Some("2099-10-22T16:00:00Z".into()),
+            usable_now: true,
+        }
+    }
+
+    fn reset_menu(usage: Option<UsageInfo>) -> MenuState {
+        MenuState::account(AccountMenuInfo {
+            alias: "work".into(),
+            email: None,
+            account_id: None,
+            plan_label: "Max".into(),
+            plan_type: None,
+            is_current: false,
+            auth_expiries: Vec::new(),
+            usage: usage.map(Box::new),
+            usage_meta: Vec::new(),
+        })
+    }
+
+    fn usage_with_grant(next: Option<&str>) -> UsageInfo {
+        UsageInfo {
+            reset_grants: Some(vec![grant("g1", 0), grant("g2", 1)]),
+            next_reset_grant: next.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// Screen text plus the cell column of the first `needle` on any row.
+    fn column_of(backend: &TestBackend, needle: &str) -> Option<(u16, u16)> {
+        let area = backend.buffer().area;
+        for y in 0..area.height {
+            let row = (0..area.width)
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_owned())
+                .collect::<String>();
+            if let Some(byte) = row.find(needle) {
+                return Some((row[..byte].chars().count() as u16, y));
+            }
+        }
+        None
+    }
+
+    fn render_menu(menu: &mut MenuState) -> (Terminal<TestBackend>, super::MenuRender) {
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        let mut rendered = None;
+        terminal
+            .draw(|frame| {
+                rendered = menu.render(frame, frame.area());
+            })
+            .unwrap();
+        (terminal, rendered.expect("menu fits the test terminal"))
+    }
+
+    /// M1: with a usable grant, `c` asks to use a reset and the action is drawn and clickable.
+    #[test]
+    fn c_uses_a_reset_when_a_grant_is_usable() {
+        let mut menu = reset_menu(Some(usage_with_grant(Some("g2"))));
+        assert!(matches!(
+            menu.handle_key(KeyCode::Char('c')),
+            MenuAction::UseReset(alias) if alias == "work"
+        ));
+
+        let (terminal, rendered) = render_menu(&mut menu);
+
+        assert!(find_text(terminal.backend(), "c reset").is_some(), "popup shows `c reset`");
+        assert!(
+            rendered.actions.iter().any(|(_, code)| *code == KeyCode::Char('c')),
+            "a hit area for `c`: {:?}",
+            rendered.actions
+        );
+    }
+
+    /// M2: without a usable grant `c` does nothing, the action is still drawn but not clickable.
+    #[test]
+    fn c_does_nothing_without_a_usable_grant() {
+        for usage in [None, Some(usage_with_grant(None))] {
+            let mut menu = reset_menu(usage);
+            assert!(matches!(menu.handle_key(KeyCode::Char('c')), MenuAction::Noop));
+
+            let (terminal, rendered) = render_menu(&mut menu);
+
+            assert!(find_text(terminal.backend(), "c reset").is_some(), "`c reset` still drawn");
+            assert!(
+                !rendered.actions.iter().any(|(_, code)| *code == KeyCode::Char('c')),
+                "no hit area for `c`: {:?}",
+                rendered.actions
+            );
+        }
+    }
+
+    /// M3: every enabled key's hit area starts where its `key label` text is drawn.
+    #[test]
+    fn action_hit_areas_sit_on_their_drawn_labels() {
+        let mut menu = reset_menu(Some(usage_with_grant(Some("g2"))));
+        let (terminal, rendered) = render_menu(&mut menu);
+
+        for (key, label) in [
+            ('u', "use"),
+            ('o', "launch"),
+            ('r', "refresh"),
+            ('l', "login"),
+            ('n', "rename"),
+            ('d', "delete"),
+            ('c', "reset"),
+        ] {
+            let text = format!("{key} {label}");
+            let (x, y) = column_of(terminal.backend(), &text)
+                .unwrap_or_else(|| panic!("`{text}` is drawn"));
+            let (area, _) = rendered
+                .actions
+                .iter()
+                .find(|(_, code)| *code == KeyCode::Char(key))
+                .unwrap_or_else(|| panic!("hit area for `{key}`: {:?}", rendered.actions));
+            assert_eq!((area.x, area.y), (x, y), "hit area of `{text}`");
+        }
     }
 
     #[test]

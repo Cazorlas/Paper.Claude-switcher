@@ -1174,6 +1174,21 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
             super::app::ConfirmAction::BatchDelete(aliases) => {
                 format!("Delete {} marked profile(s)? (y/n)", aliases.len())
             }
+            super::app::ConfirmAction::UseReset { alias, label, resets_left, ends_at } => {
+                let until = ends_at
+                    .as_deref()
+                    .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                    .map(|at| {
+                        format!(
+                            " · until {}",
+                            at.with_timezone(&chrono::Local).format("%m-%d")
+                        )
+                    })
+                    .unwrap_or_default();
+                format!(
+                    "Use a reset for '{alias}'? {label} · {resets_left} left{until} (y/n)"
+                )
+            }
 
         };
         let line = Line::from(Span::styled(
@@ -1183,6 +1198,8 @@ fn render_status_bar(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(Paragraph::new(line).style(base()), area);
         app.hitmap.overlay_panel = Some(area);
         if let Some(pos) = msg.find("(y/n)") {
+            // Columns, not bytes: the prompt may hold a multi-byte `·`.
+            let pos = msg[..pos].chars().count();
             register_overlay_key(app, area, pos + 1, 1, KeyCode::Char('y'));
             register_overlay_key(app, area, pos + 3, 1, KeyCode::Char('n'));
         } else if let Some(pos) = msg.find("y to use") {
