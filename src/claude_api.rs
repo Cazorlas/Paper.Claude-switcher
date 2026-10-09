@@ -237,9 +237,9 @@ pub enum UsageError {
 
 /// Claude Code version the usage request names; `CS_CLAUDE_CODE_VERSION`
 /// overrides it when Anthropic starts expecting a newer one.
-const CLAUDE_CODE_VERSION: &str = "2.1.294";
+const CLAUDE_CODE_VERSION: &str = "2.1.295";
 
-/// The User-Agent Claude Code sends, e.g. `claude-cli/2.1.294 (external, cli)`.
+/// The User-Agent Claude Code sends, e.g. `claude-cli/2.1.295 (external, cli)`.
 pub fn claude_code_user_agent() -> String {
     let version = std::env::var("CS_CLAUDE_CODE_VERSION")
         .ok()
