@@ -285,6 +285,138 @@ async fn delete_refuses_the_live_account_even_when_marker_names_another() {
     assert!(f.path("app/profiles/personal/credentials.json").exists());
 }
 
+fn profile_and_live_snapshot(f: &Fixture) -> Vec<(PathBuf, Vec<u8>)> {
+    fn visit(dir: &Path, files: &mut Vec<(PathBuf, Vec<u8>)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, files);
+            } else {
+                files.push((path.clone(), fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    visit(&f.path("app/profiles"), &mut files);
+    visit(&f.path("claude"), &mut files);
+    files.push((f.path("app/current"), fs::read(f.path("app/current")).unwrap()));
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_archives_resolved_alias_without_changing_live_account() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    let before = profile_and_live_snapshot(&f);
+    let output = f.run(&["--json", "delete", "2", "--yes"]);
+    success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["alias"], "work");
+    assert_eq!(value["action"], "deleted");
+    assert_eq!(value["ok"], true);
+    assert!(!f.path("app/profiles/work").exists());
+    let archives = archived_credentials(&f);
+    assert_eq!(archives.len(), 1);
+    assert_eq!(read_json(&archives[0])["claudeAiOauth"]["accessToken"], "tokB");
+    let expected: Vec<_> = before
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(f.path("app/profiles/work")))
+        .collect();
+    assert_eq!(profile_and_live_snapshot(&f), expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_prefers_a_literal_numeric_alias() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    f.profile("2", "tokC", "U3", "c@x.com");
+    let before = profile_and_live_snapshot(&f);
+    // List order is 2, personal, work: position 2 would name the live account.
+    let output = f.run(&["--json", "delete", "2", "--yes"]);
+    success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["alias"], "2");
+    assert!(!f.path("app/profiles/2").exists());
+    assert_eq!(archived_credentials(&f).len(), 1);
+    let expected: Vec<_> = before
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(f.path("app/profiles/2")))
+        .collect();
+    assert_eq!(profile_and_live_snapshot(&f), expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_refuses_live_account_with_a_stale_marker() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    fs::write(f.path("app/current"), "work").unwrap();
+    let mut expected = profile_and_live_snapshot(&f);
+    // Active-account detection repairs a stale marker, including on refusal.
+    // Every credential and account file must remain byte-for-byte unchanged.
+    for (path, bytes) in &mut expected {
+        if *path == f.path("app/current") {
+            *bytes = b"personal".to_vec();
+        }
+    }
+    let output = f.run(&["delete", "1", "--yes"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("active") && stderr.contains("personal"), "{}", describe(&output));
+    assert_eq!(profile_and_live_snapshot(&f), expected);
+    assert!(archived_credentials(&f).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_requires_confirmation_for_the_resolved_alias() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    let before = profile_and_live_snapshot(&f);
+    let output = f.run(&["delete", "2"]);
+    assert!(!output.status.success(), "{}", describe(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("confirmation required") && stderr.contains("work"),
+        "{}",
+        describe(&output)
+    );
+    assert_eq!(profile_and_live_snapshot(&f), before);
+    assert!(archived_credentials(&f).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_rejects_zero_and_out_of_range_without_changes() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    let before = profile_and_live_snapshot(&f);
+    for index in ["0", "99"] {
+        let output = f.run(&["delete", index, "--yes"]);
+        assert!(!output.status.success(), "{}", describe(&output));
+        assert_eq!(profile_and_live_snapshot(&f), before);
+        assert!(archived_credentials(&f).is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_index_uses_list_order_skipping_malformed_profiles() {
+    let f = Fixture::new(&[]).await;
+    f.two_profiles();
+    fs::create_dir_all(f.path("app/profiles/aaa-broken")).unwrap();
+    fs::write(f.path("app/profiles/aaa-broken/credentials.json"), "not JSON").unwrap();
+    let output = f.run(&["--json", "list"]);
+    success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["profiles"][0]["alias"], "personal");
+    assert_eq!(value["profiles"][1]["alias"], "work");
+    let output = f.run(&["--json", "delete", "2", "--yes"]);
+    success(&output);
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["alias"], "work");
+    assert!(!f.path("app/profiles/work").exists());
+    assert!(f.path("app/profiles/personal/credentials.json").exists());
+    assert_eq!(fs::read_to_string(f.path("app/profiles/aaa-broken/credentials.json")).unwrap(), "not JSON");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn restore_brings_back_a_deleted_claude_profile() {
     let f = Fixture::new(&[("tokA", 50.0, 20.0), ("tokB", 10.0, 5.0)]).await;

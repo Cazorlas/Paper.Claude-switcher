@@ -258,6 +258,12 @@ pub(crate) fn delete_cmd(alias: &str, yes: bool, json: bool) -> Result<()> {
     use std::io::IsTerminal;
 
     profile::validate_alias(alias)?;
+    let by_index = if !profile::profile_auth_path(alias)?.exists() && alias.parse::<usize>().is_ok() {
+        resolve_profile_index(alias, &claude_usage::profiles()?)
+    } else {
+        None
+    };
+    let alias = by_index.as_deref().unwrap_or(alias);
     if !profile::profile_auth_path(alias)?.exists() {
         anyhow::bail!("profile '{alias}' not found");
     }

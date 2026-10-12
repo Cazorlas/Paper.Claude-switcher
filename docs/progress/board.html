@@ -20,6 +20,20 @@ code{font-family:var(--mono);font-size:13px}
 </style>
 <main>
 <header><h1>paper-claude-switch</h1><p class="sub">Progress board. Branch <code>collab/main/claude-switch</code>. Newest task on top.</p></header>
+<section id="delete-index">
+<h2>Delete a saved account by list index</h2>
+<p class="sub">Started 2026-10-12. Scope: CLI selection only; archives and active-account protection remain in place.</p>
+<div class="wrap"><table>
+<tr><th>Step</th><th>What</th><th>Status</th></tr>
+<tr><td>Plan</td><td>Resolve 1-based list index; literal numeric alias wins. Tests cover selection, invalid indices, active account and confirmation.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Red</td><td>Six isolated regression tests locked. GNU delete tests: 4 expected index failures, 4 pass. MSVC linker unavailable; existing GNU toolchain used.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Green</td><td>Selection, CLI help and README implemented. Planner corrected stale-marker expectation to existing marker repair; all credential byte comparisons retained.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Review</td><td>Diff reviewed; <code>cargo +stable-x86_64-pc-windows-gnu test --locked --offline</code>: 331 passed, including all six index regressions. No real accounts used.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Build</td><td><code>cargo +stable-x86_64-pc-windows-gnu build --release --locked --offline</code> passed; local binary reports 0.6.2 and delete help documents list numbers.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Merge / release</td><td>Merge task branch into main and publish v0.6.2 through the existing release workflow.</td><td><span class="st todo">pending</span></td></tr>
+<tr><td>Update / cleanup</td><td>Update installed npm package, verify version/help, remove task branch and task-only temporary files.</td><td><span class="st todo">pending</span></td></tr>
+</table></div>
+</section>
 <section id="use-reset">
 <h2>Use a usage-limit reset from the TUI</h2>
 <p class="sub">Started 2026-10-09. Branch <code>collab/main/use-reset</code>. Planner: Claude (this session). Worker: Claude worker via collab (Codex sandbox cannot link Rust). TUI only, no CLI command (owner's call).</p>

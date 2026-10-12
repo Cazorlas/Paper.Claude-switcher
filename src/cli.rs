@@ -107,7 +107,7 @@ Examples:
     },
     /// Delete a profile (archived for recovery)
     Delete {
-        /// Profile alias
+        /// Profile alias or its number in `list`
         alias: String,
         /// Skip the confirmation prompt (required with --json or when stdin is not a terminal)
         #[arg(long, short)]
