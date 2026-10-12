@@ -78,7 +78,7 @@ No restart needed: Claude Code re-reads its credential file when it changes, so 
 | Save the current Claude Code login | `paper-claude-switch login [alias]` |
 | Save a renewed login after running `/login` in Claude Code | `paper-claude-switch login <existing alias>` |
 | Rename | `paper-claude-switch rename <old> <new>` |
-| Delete (archived, recoverable; the active account can't be deleted) | `paper-claude-switch delete <alias> [--yes]` |
+| Delete (archived, recoverable; the active account can't be deleted) | `paper-claude-switch delete <alias-or-number> [--yes]` |
 | List deleted accounts / bring one back | `paper-claude-switch restore` / `paper-claude-switch restore <alias> [--as <new>]` |
 | Import the accounts Orca manages | `paper-claude-switch import-orca [--dry-run]` |
 | Refresh usage now, ignoring the cache | `paper-claude-switch list --force` |
@@ -87,7 +87,7 @@ No restart needed: Claude Code re-reads its credential file when it changes, so 
 
 Global flags: `--json` / `--json-pretty` (machine-readable output), `--proxy <url>`, `--color always|never`, `--debug`. Settings live in `~/.paper-claude-switch/config.toml` (also editable in the `tui` Settings tab).
 
-To remove accounts you no longer use: `list`, then `delete <alias>`. Deleting is not final: `restore` lists what was deleted and `restore <alias>` brings the newest archive back (use `--as` if the name is taken). Archives live in `~/.paper-claude-switch/deleted-profiles`. `auto` only switches between saved accounts, so deleting an account also takes it out of rotation.
+To remove accounts you no longer use: `list`, then `delete <alias>` or `delete 2` for account number 2. Numbers follow the current `list` order; a profile literally named `2` takes priority over position 2. Numbers shift after each deletion, so run `list` again before deleting another account by number. Deleting is not final: `restore` lists what was deleted and `restore <alias>` brings the newest archive back (use `--as` if the name is taken). Archives live in `~/.paper-claude-switch/deleted-profiles`. `auto` only switches between saved accounts, so deleting an account also takes it out of rotation.
 
 ### Using with Orca
 

@@ -28,10 +28,10 @@ code{font-family:var(--mono);font-size:13px}
 <tr><td>Plan</td><td>Resolve 1-based list index; literal numeric alias wins. Tests cover selection, invalid indices, active account and confirmation.</td><td><span class="st done">done</span></td></tr>
 <tr><td>Red</td><td>Six isolated regression tests locked. GNU delete tests: 4 expected index failures, 4 pass. MSVC linker unavailable; existing GNU toolchain used.</td><td><span class="st done">done</span></td></tr>
 <tr><td>Green</td><td>Selection, CLI help and README implemented. Planner corrected stale-marker expectation to existing marker repair; all credential byte comparisons retained.</td><td><span class="st done">done</span></td></tr>
-<tr><td>Review</td><td>Diff reviewed; <code>cargo +stable-x86_64-pc-windows-gnu test --locked --offline</code>: 331 passed, including all six index regressions. No real accounts used.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Review</td><td>Diff reviewed; <code>cargo +stable-x86_64-pc-windows-gnu test --locked --offline</code>: 331 passed, including all six index regressions. <a href="https://github.com/Cazorlas/Paper.Claude-switcher/actions/runs/38187846930">MSVC CI</a> passed too. No real accounts used.</td><td><span class="st done">done</span></td></tr>
 <tr><td>Build</td><td><code>cargo +stable-x86_64-pc-windows-gnu build --release --locked --offline</code> passed; local binary reports 0.6.2 and delete help documents list numbers.</td><td><span class="st done">done</span></td></tr>
-<tr><td>Merge / release</td><td>Merge task branch into main and publish v0.6.2 through the existing release workflow.</td><td><span class="st todo">pending</span></td></tr>
-<tr><td>Update / cleanup</td><td>Update installed npm package, verify version/help, remove task branch and task-only temporary files.</td><td><span class="st todo">pending</span></td></tr>
+<tr><td>Merge / release</td><td>Task commit <code>4b23542</code> fast-forward merged and pushed to main. <a href="https://github.com/Cazorlas/Paper.Claude-switcher/actions/runs/38187848505">v0.6.2 release</a> passed: all four assets and npm 0.6.2 published.</td><td><span class="st done">done</span></td></tr>
+<tr><td>Update / cleanup</td><td><code>paper-claude-switch self-update</code> installed 0.6.2; version/help checked. Installed MSVC binary passed isolated checks for index selection, confirmation, active-account guard and unchanged live credentials. Task branch deleted after merge; no task worktree created. Task-only scratch files removed; saved accounts untouched.</td><td><span class="st done">done</span></td></tr>
 </table></div>
 </section>
 <section id="use-reset">
