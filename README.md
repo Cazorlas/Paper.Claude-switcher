@@ -1,4 +1,6 @@
-﻿# paper-claude-switch
+﻿<p align="center"><img src="https://raw.githubusercontent.com/Cazorlas/Paper.Claude-switcher/main/assets/logo.svg" width="128" alt="paper-claude-switch logo"></p>
+
+# paper-claude-switch
 
 **Multi-account switcher for Claude Code (CLI and VS Code extension), with automatic switching before you hit a usage limit.**
 
