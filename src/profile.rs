@@ -634,7 +634,15 @@ mod tests {
             super::notify_on_test_lock_attempt("auth", attempt_tx);
             let _ = done_tx.send(super::switch_profile("next-profile"));
         });
-        let mut cleanup = ThreadCleanup::new(lock_file);
+        // Closing a locked handle releases the lock only "when system resources allow"
+        // on Windows, which took over 10 s on a busy CI runner; unlock explicitly.
+        struct UnlockOnDrop(std::fs::File);
+        impl Drop for UnlockOnDrop {
+            fn drop(&mut self) {
+                let _ = FileExt::unlock(&self.0);
+            }
+        }
+        let mut cleanup = ThreadCleanup::new(UnlockOnDrop(lock_file));
         cleanup.push(handle);
 
         attempt_rx
