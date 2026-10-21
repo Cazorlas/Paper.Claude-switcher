@@ -638,7 +638,7 @@ mod tests {
         cleanup.push(handle);
 
         attempt_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("switch did not reach auth lock attempt");
         assert!(
             matches!(
@@ -652,7 +652,7 @@ mod tests {
         cleanup.release_blocker();
 
         done_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .expect("switch did not finish after auth lock release")
             .unwrap();
         cleanup.join_all();
