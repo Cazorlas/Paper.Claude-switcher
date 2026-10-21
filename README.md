@@ -189,7 +189,7 @@ To use a reset from the switcher, open the account menu (Enter on the account) a
 
 Anthropic only reveals this to Claude Code itself, so the usage request identifies as Claude Code (`User-Agent: claude-cli/<version>`, `x-app: cli`). If Anthropic starts expecting a newer Claude Code version, set `CS_CLAUDE_CODE_VERSION` (for example to the output of `claude --version`) until paper-claude-switch is updated.
 
-The default request identity is Claude Code **2.1.299**, matching Anthropic's [latest changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) when checked on 2026-10-14. This updates the identity used for usage and reset requests; it does not install or update Claude Code.
+The default request identity is Claude Code **2.1.306**, matching Anthropic's [latest changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) when checked on 2026-10-21. This updates the identity used for usage and reset requests; it does not install or update Claude Code.
 
 ## How it works
 
