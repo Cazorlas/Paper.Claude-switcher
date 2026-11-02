@@ -18,10 +18,36 @@ jobs:
     steps:
       - id: meta
         uses: dependabot/fetch-metadata@v3
-      - if: >-
-          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
-          (steps.meta.outputs.update-type == 'version-update:semver-minor' &&
-           !startsWith(steps.meta.outputs.previous-version, '0.'))
+      # A grouped or indirect update (e.g. "bump rustls ... in the cargo group")
+      # comes back with update-type null, so fall back to the versions, taken
+      # from the title when the metadata has none. Several updates in one PR
+      # leave no single pair to read and are left for review.
+      - id: kind
+        env:
+          TYPE: ${{ steps.meta.outputs.update-type }}
+          PREV: ${{ steps.meta.outputs.previous-version }}
+          NEW: ${{ steps.meta.outputs.new-version }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if [ -z "$PREV" ] || [ -z "$NEW" ]; then
+            if [ "$(grep -o ' from [^ ]* to [^ ]*' <<<"$TITLE" | wc -l)" = 1 ]; then
+              read -r _ PREV _ NEW <<<"$(grep -o ' from [^ ]* to [^ ]*' <<<"$TITLE")"
+            fi
+          fi
+          if { [ -z "$TYPE" ] || [ "$TYPE" = null ]; } && [ -n "$PREV" ] && [ -n "$NEW" ]; then
+            IFS=. read -r a b _ <<<"$PREV"; IFS=. read -r c d _ <<<"$NEW"
+            if [ "$a" != "$c" ]; then TYPE=version-update:semver-major
+            elif [ "$b" != "$d" ]; then TYPE=version-update:semver-minor
+            else TYPE=version-update:semver-patch; fi
+          fi
+          merge=false
+          case "$TYPE" in
+            version-update:semver-patch) merge=true ;;
+            version-update:semver-minor) [[ "$PREV" == 0.* ]] || merge=true ;;
+          esac
+          echo "update-type=$TYPE previous=$PREV new=$NEW merge=$merge"
+          echo "merge=$merge" >> "$GITHUB_OUTPUT"
+      - if: steps.kind.outputs.merge == 'true'
         run: gh pr merge "$PR" --squash --delete-branch
         env:
           PR: ${{ github.event.pull_request.html_url }}
